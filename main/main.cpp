@@ -241,6 +241,7 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
 #endif // ENABLE_BLE
 
 int64_t rtc_now_ms();
+static esp_err_t copy_file_overwrite(const char* src_path, const char* dst_path);
 
 static void debug_log_line(const std::string& msg);
 //exported symbol (linkable from other .cpp)
@@ -374,6 +375,36 @@ static bool is_log_file_on_spiffs(const char* name) {
          (strcmp(name, "Station.ini") == 0) ||
          (strcmp(name, "fieldday.log") == 0);
 }
+
+static bool file_exists(const char* path) {
+  struct stat st;
+  return (stat(path, &st) == 0) && S_ISREG(st.st_mode);
+}
+
+static void sync_station_ini_from_sd_to_spiffs() {
+  static const char* TAG = "FT8";
+  // Best effort only:
+  // if SD mount or copy fails, keep using the Station.ini already in SPIFFS.
+  if (ensure_sdcard_mounted() != ESP_OK) {
+    ESP_LOGI(TAG, "SD not mounted, using SPIFFS Station.ini");
+    return;
+  }
+
+  const char* sd_path = "/sdcard/Station.ini";
+  const char* spiffs_path = "/spiffs/Station.ini";
+
+  if (!file_exists(sd_path)) {
+    ESP_LOGI(TAG, "No Station.ini on SD, using SPIFFS Station.ini");
+    return;
+  }
+
+  if (copy_file_overwrite(sd_path, spiffs_path) == ESP_OK) {
+    ESP_LOGI(TAG, "Copied Station.ini from SD to SPIFFS");
+  } else {
+    ESP_LOGW(TAG, "Failed to copy Station.ini from SD, using SPIFFS Station.ini");
+  }
+}
+
 
 static esp_err_t copy_file_overwrite(const char* src_path, const char* dst_path) {
   FILE* fs = fopen(src_path, "rb");
@@ -3082,6 +3113,9 @@ static void poll_ble_uart() {
 #endif // ENABLE_BLE
 
 static void load_station_data() {
+  // If Station.ini exists on SD, prefer it by copying onto SPIFFS first.
+  // If mount/copy fails, fall back to the on-device SPIFFS Station.ini.
+  sync_station_ini_from_sd_to_spiffs();
 
   FILE* f = fopen(STATION_FILE, "r");
   if (!f) return;

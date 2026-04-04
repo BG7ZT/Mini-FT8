@@ -67,6 +67,21 @@ static bool looks_like_report(const std::string& s, int& out);
 static void log_qso_if_needed(QsoContext* ctx);
 static std::string normalize_call_token(const std::string& s);
 
+// Returns true if we've exchanged any meaningful data with DX (grid, SNR, FD exchange).
+// Conservative: if any metadata was captured, we preserve the context.
+static bool has_exchanged(const QsoContext* ctx) {
+    if (!ctx) return false;
+    if (ctx->dxcall.empty() || ctx->dxcall == "CQ") return false;
+    // Any of these indicate real data was exchanged
+    if (!ctx->dxgrid.empty()) return true;
+    if (ctx->snr_tx != -99) return true;
+    if (ctx->snr_rx != -99) return true;
+    if (ctx->is_fd) return true;
+    // We advanced past REPLYING — DX sent us something we processed
+    if (ctx->state > AutoseqState::REPLYING) return true;
+    return false;
+}
+
 // ============== Public API ==============
 
 void autoseq_init() {
@@ -122,9 +137,9 @@ bool autoseq_rotate_same_parity() {
 }
 
 void autoseq_start_cq(int slot_parity) {
-    // Don't add duplicate CQ at bottom
-    if (s_queue_size > 0 && s_queue_size < AUTOSEQ_MAX_QUEUE) {
-        if (s_queue[s_queue_size - 1].state == AutoseqState::CALLING) {
+    // Don't add duplicate CQ at bottom of active entries
+    for (int i = 0; i < s_queue_size; ++i) {
+        if (!s_queue[i].inactive && s_queue[i].state == AutoseqState::CALLING) {
             return;
         }
     }
@@ -143,8 +158,17 @@ void autoseq_start_cq(int slot_parity) {
     ESP_LOGI(TAG, "Started CQ on slot %d", slot_parity);
 }
 
+// Count active (non-inactive) entries in the queue
+static int active_count() {
+    int n = 0;
+    for (int i = 0; i < s_queue_size; ++i) {
+        if (!s_queue[i].inactive) ++n;
+    }
+    return n;
+}
+
 void autoseq_on_touch(const UiRxLine& msg) {
-    // If queue is full, remove the last one
+    // If queue is completely full, remove the last entry (oldest inactive or lowest priority)
     if (s_queue_size == AUTOSEQ_MAX_QUEUE) {
         --s_queue_size;
     }
@@ -231,47 +255,45 @@ void autoseq_tick(int64_t slot_idx, int slot_parity, int ms_to_boundary) {
     if (s_queue_size == 0) return;
 
     QsoContext* ctx = &s_queue[0];
+    if (ctx->inactive) return;  // Front is inactive — nothing to tick
 
-    // Advance retry counter or timeout - sets up NEXT TX attempt
+    // Advance retry counter or move to inactive zone
     switch (ctx->state) {
         case AutoseqState::REPLYING:
-            if (ctx->retry_counter < ctx->retry_limit) {
-                ctx->next_tx = TxMsgType::TX1;
-                ctx->retry_counter++;
-            } else {
-                ctx->state = AutoseqState::IDLE;
-                ctx->next_tx = TxMsgType::TX_UNDEF;
-            }
-            break;
         case AutoseqState::REPORT:
-            if (ctx->retry_counter < ctx->retry_limit) {
-                ctx->next_tx = TxMsgType::TX2;
-                ctx->retry_counter++;
-            } else {
-                ctx->state = AutoseqState::IDLE;
-                ctx->next_tx = TxMsgType::TX_UNDEF;
-            }
-            break;
         case AutoseqState::ROGER_REPORT:
+        case AutoseqState::ROGERS: {
             if (ctx->retry_counter < ctx->retry_limit) {
-                ctx->next_tx = TxMsgType::TX3;
+                // Set up next retry based on current state
+                switch (ctx->state) {
+                    case AutoseqState::REPLYING:     ctx->next_tx = TxMsgType::TX1; break;
+                    case AutoseqState::REPORT:       ctx->next_tx = TxMsgType::TX2; break;
+                    case AutoseqState::ROGER_REPORT: ctx->next_tx = TxMsgType::TX3; break;
+                    case AutoseqState::ROGERS:       ctx->next_tx = TxMsgType::TX4; break;
+                    default: break;
+                }
                 ctx->retry_counter++;
+            } else if (has_exchanged(ctx)) {
+                // Retries exhausted but we exchanged data with DX — move to
+                // inactive zone to preserve metadata in case DX retries.
+                ctx->inactive = true;
+                ctx->next_tx = TxMsgType::TX_UNDEF;
+                sort_and_clean();
             } else {
+                // No exchange happened (e.g. sent TX1 but got nothing back).
+                // Safe to evict.
                 ctx->state = AutoseqState::IDLE;
                 ctx->next_tx = TxMsgType::TX_UNDEF;
             }
             break;
-        case AutoseqState::ROGERS:
-            if (ctx->retry_counter < ctx->retry_limit) {
-                ctx->next_tx = TxMsgType::TX4;
-                ctx->retry_counter++;
-            } else {
-                ctx->state = AutoseqState::IDLE;
-                ctx->next_tx = TxMsgType::TX_UNDEF;
-            }
-            break;
+        }
         case AutoseqState::CALLING:  // CQ only once (controlled by beacon)
-        case AutoseqState::SIGNOFF:  // QSO complete, remove from queue
+            // CQ with no response — safe to evict (dxcall is "CQ")
+            ctx->state = AutoseqState::IDLE;
+            ctx->next_tx = TxMsgType::TX_UNDEF;
+            break;
+        case AutoseqState::SIGNOFF:
+            // QSO complete and logged — safe to evict
             ctx->state = AutoseqState::IDLE;
             ctx->next_tx = TxMsgType::TX_UNDEF;
             break;
@@ -298,7 +320,7 @@ bool autoseq_get_next_tx(std::string& out_text) {
     if (s_queue_size == 0) return false;
 
     QsoContext* ctx = &s_queue[0];
-    if (ctx->state == AutoseqState::IDLE || ctx->next_tx == TxMsgType::TX_UNDEF) {
+    if (ctx->inactive || ctx->state == AutoseqState::IDLE || ctx->next_tx == TxMsgType::TX_UNDEF) {
         return false;
     }
 
@@ -312,7 +334,7 @@ bool autoseq_fetch_pending_tx(AutoseqTxEntry& out) {
     if (s_queue_size == 0) return false;
 
     QsoContext* ctx = &s_queue[0];
-    if (ctx->state == AutoseqState::IDLE || ctx->next_tx == TxMsgType::TX_UNDEF) {
+    if (ctx->inactive || ctx->state == AutoseqState::IDLE || ctx->next_tx == TxMsgType::TX_UNDEF) {
         return false;
     }
 
@@ -346,12 +368,13 @@ void autoseq_mark_sent(int64_t slot_idx) {
 void autoseq_get_qso_states(std::vector<std::string>& out) {
     out.clear();
     static const char* state_names[] = {
-        "CALL", "RPLY", "RPRT", "RRPT", "RGRS", "SOFF", ""
+        "CALL", "RPLY", "RPRT", "RRPT", "RGRS", "SOFF", "", "ZZZ"
     };
 
     for (int i = 0; i < s_queue_size; ++i) {
         const QsoContext* ctx = &s_queue[i];
         if (ctx->state == AutoseqState::IDLE) continue;
+        if (ctx->inactive) continue;  // Don't show inactive entries in UI
 
         char buf[32];
         snprintf(buf, sizeof(buf), "%-8.8s %.4s %d/%d",
@@ -364,6 +387,7 @@ void autoseq_get_qso_states(std::vector<std::string>& out) {
 
 bool autoseq_has_active_qso() {
     for (int i = 0; i < s_queue_size; ++i) {
+        if (s_queue[i].inactive) continue;
         if (s_queue[i].state != AutoseqState::IDLE &&
             s_queue[i].state != AutoseqState::CALLING) {
             return true;
@@ -373,7 +397,7 @@ bool autoseq_has_active_qso() {
 }
 
 int autoseq_queue_size() {
-    return s_queue_size;
+    return active_count();
 }
 
 void autoseq_set_adif_callback(AdifLogCallback cb) {
@@ -628,6 +652,13 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
         return false;
     }
 
+    // Reactivate inactive (dormant) contexts when DX retries
+    if (ctx->inactive) {
+        ESP_LOGI(TAG, "generate_response: reactivating dormant ctx for %s (rcvd=%d)",
+                 ctx->dxcall.c_str(), (int)rcvd);
+        ctx->inactive = false;
+    }
+
     // Update SNR we report to them on initial messages
     if (rcvd == TxMsgType::TX1 || rcvd == TxMsgType::TX2) {
         ctx->snr_tx = msg.snr;
@@ -748,6 +779,11 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
 
         case AutoseqState::ROGERS:  // We sent TX4
             switch (rcvd) {
+                case TxMsgType::TX3:
+                    // DX didn't get our RR73 — re-send with fresh retries.
+                    // Already logged at ROGERS entry; logged flag prevents duplicate.
+                    set_state(ctx, AutoseqState::ROGERS, TxMsgType::TX4, AUTOSEQ_MAX_RETRY);
+                    return true;
                 case TxMsgType::TX4:
                 case TxMsgType::TX5:
                     // Already logged at ROGERS entry - just mark complete
@@ -805,19 +841,31 @@ static void on_decode(const UiRxLine& msg) {
         }
     }
 
-    // Check message type before creating new context
-    // Don't create context for signoff messages (RR73/73) - these are late
-    // messages from completed QSOs
+    // No matching context (active or inactive) for this DX.
+    // Reject messages that would produce wrong metadata if a fresh context
+    // were created. TX3 (R+report) skips the snr_tx latch — that's the
+    // reincarnation bug. Signoff messages (RR73/73) are also rejected.
+    // TX1 (grid), TX2 (report), and FD exchanges are allowed — they set
+    // snr_tx correctly via msg.snr in generate_response().
     std::string f3 = msg.field3;
     for (auto& ch : f3) ch = toupper((unsigned char)ch);
     if (f3 == "RR73" || f3 == "RRR" || f3 == "73") {
-        ESP_LOGW(TAG, "on_decode: ignoring late signoff from %s (no active ctx)",
+        ESP_LOGW(TAG, "on_decode: ignoring late signoff from %s (no ctx)",
                  dxcall.c_str());
         return;
     }
+    // Reject R+report (TX3) from unknown DX — snr_tx would be -99
+    if (!f3.empty() && f3[0] == 'R' && f3.size() > 1) {
+        int rpt = 0;
+        if (looks_like_report(f3.substr(1), rpt)) {
+            ESP_LOGW(TAG, "on_decode: rejecting R+report from %s (no ctx, would lose snr_tx)",
+                     dxcall.c_str());
+            return;
+        }
+    }
 
-    ESP_LOGW(TAG, "on_decode: NO ctx found for %s, creating new (queue_size=%d)",
-             dxcall.c_str(), s_queue_size);
+    ESP_LOGI(TAG, "on_decode: new QSO from %s (field3=%s, queue_size=%d)",
+             dxcall.c_str(), f3.c_str(), s_queue_size);
 
     // No matching context - create new if queue not full
     if (s_queue_size >= AUTOSEQ_MAX_QUEUE) {
@@ -833,11 +881,15 @@ static void on_decode(const UiRxLine& msg) {
 // Comparison for std::sort: IDLE at top (to be popped), CALLING at bottom
 // Returns true if left should come before right
 static bool compare_ctx(const QsoContext& left, const QsoContext& right) {
+    // Inactive entries always sort AFTER active entries
+    if (left.inactive != right.inactive) {
+        return !left.inactive;  // active before inactive
+    }
+
+    // Among active entries (or among inactive): same rules as before
     // Same state? Lower retry count gets priority — round-robin among
     // contacts so we probe for viable propagation paths rather than
     // burning all retries on one potentially dead contact.
-    // State priority (below) ensures responsive contacts that advance
-    // in the QSO sequence still get completed first.
     if (left.state == right.state) {
         return left.retry_counter < right.retry_counter;
     }

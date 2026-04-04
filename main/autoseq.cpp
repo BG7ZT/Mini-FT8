@@ -67,19 +67,14 @@ static bool looks_like_report(const std::string& s, int& out);
 static void log_qso_if_needed(QsoContext* ctx);
 static std::string normalize_call_token(const std::string& s);
 
-// Returns true if we've exchanged any meaningful data with DX (grid, SNR, FD exchange).
-// Conservative: if any metadata was captured, we preserve the context.
+// Returns true if we've exchanged reports with DX — meaning we sent TX2/TX3
+// (a report or R+report) so the metadata (snr_tx) is what we actually transmitted.
+// REPLYING (sent TX1 = grid only) is safe to evict: no reports exchanged yet,
+// and if DX retries with TX2, a fresh context gets correct snr_tx from msg.snr.
 static bool has_exchanged(const QsoContext* ctx) {
     if (!ctx) return false;
     if (ctx->dxcall.empty() || ctx->dxcall == "CQ") return false;
-    // Any of these indicate real data was exchanged
-    if (!ctx->dxgrid.empty()) return true;
-    if (ctx->snr_tx != -99) return true;
-    if (ctx->snr_rx != -99) return true;
-    if (ctx->is_fd) return true;
-    // We advanced past REPLYING — DX sent us something we processed
-    if (ctx->state > AutoseqState::REPLYING) return true;
-    return false;
+    return ctx->state > AutoseqState::REPLYING;
 }
 
 // ============== Public API ==============

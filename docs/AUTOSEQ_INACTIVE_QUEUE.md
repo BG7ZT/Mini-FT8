@@ -71,54 +71,80 @@ s_queue[s_active_count .. s_queue_size-1] → Inactive zone: retries exhausted, 
 
 3. **Eviction only when safe.** A context can be evicted (popped) only if:
    - `logged == true` — ADIF has the correct entry, safe to discard
-   - No exchange occurred — bare CQ with dxcall="CQ", nothing to preserve
+   - State is CALLING or REPLYING — no reports exchanged yet. CALLING is a bare
+     CQ. REPLYING means we only sent TX1 (grid); if DX retries with TX2, a fresh
+     context gets correct snr_tx from msg.snr, so nothing valuable is lost.
+   - Contexts in REPORT or beyond (sent TX2+) must be preserved — they carry the
+     snr_tx we actually transmitted, which would be lost on eviction.
 
-4. **Reject unknown mid-QSO messages.** If DX sends a mid-QSO message (TX2, TX3)
-   but has no context in either active or inactive zone, reject it. Only TX1 (grid,
-   i.e. a new QSO start) from an unknown DX creates a new context. This prevents
-   reincarnation with lost metadata entirely.
+4. **Reject only R+report (TX3) from unknown DX.** If DX sends TX3 (R+report)
+   and has no context in either active or inactive zone, reject it — TX3 skips
+   the snr_tx latch, producing wrong ADIF metadata. All other message types are
+   allowed for new context creation:
+   - TX1 (grid): new QSO start, correct metadata
+   - TX2 (report): DX skipped TX1 (WSJT-X "skip TX1" feature), snr_tx set from
+     msg.snr, snr_rx from report text — correct metadata
+   - FD exchange: equivalent to TX2 in Field Day mode — correct metadata
+   - TX4/TX5 (RR73/73): filtered separately by signoff guard
 
 5. **Time-based expiry.** Inactive contexts expire after a configurable window.
    Expired inactive contexts are evicted regardless of logged state — if we haven't
    heard from DX in that long, the QSO is truly dead.
 
-### Queue Sizing
+### Queue Layout: Dynamic Boundary
 
-Queue size: **120 entries.** This accommodates a busy 1-hour activation:
-- Active zone: ~9 concurrent QSOs (same as before)
-- Inactive zone: up to ~111 dormant contexts preserving metadata
+The active and inactive zones share a single array and grow from opposite ends.
+No fixed partition — both zones expand until their pointers meet.
 
-The QsoContext struct is small (~80 bytes with std::string SSO), so 120 entries
-is ~10 KB — negligible on ESP32-S3 (512 KB SRAM).
+```
+s_queue[]:
+ index 0                                               index AUTOSEQ_MAX_QUEUE-1
+ ┌──────────────────────┬────────────┬──────────────────────┐
+ │   Active zone        │  (free)    │   Inactive zone      │
+ │   grows →            │            │            ← grows   │
+ └──────────────────────┴────────────┴──────────────────────┘
+       s_active_count ──┘            └── s_inactive_start
+```
+
+- `s_active_count`: number of active entries at the front (grows right)
+- `s_inactive_start`: index of first inactive entry at the back (grows left)
+- Free space: `s_inactive_start - s_active_count`
+- When both pointers meet (free space = 0), queue is full:
+  evict the oldest inactive entry (rightmost) to make room.
+
+Queue size: **120 entries.** This accommodates a busy 1-hour activation.
+QsoContext is ~80 bytes with std::string SSO, so 120 entries ≈ 10 KB —
+negligible on ESP32-S3 (512 KB SRAM).
 
 ### Sort Order
 
+Active entries are sorted by state priority (same as before):
 ```
-Active entries (sorted by state priority, same as before):
   IDLE > SIGNOFF > ROGERS > ROGER_REPORT > REPORT > REPLYING > CALLING
-
-Inactive entries (sorted to the back):
-  All inactive entries sort BELOW all active entries.
-  Among inactive entries: order doesn't matter (they don't TX).
 ```
+
+Inactive entries are stored at the back in insertion order (oldest at the
+rightmost end). When eviction is needed, the oldest (rightmost) entry is
+removed first.
 
 ### Modified tick() Behavior
 
 ```
 Before:  retry exhausted → state = IDLE → pop_front()
-After:   retry exhausted → inactive = true → sort to back (metadata preserved)
+After:   retry exhausted + state > REPLYING → move to inactive zone at back
+         retry exhausted + state <= REPLYING → evict (no reports exchanged)
 ```
 
-tick() only processes the front entry. If the front entry is inactive (shouldn't
-happen after sort, but as a guard), skip it.
+tick() only processes the front of the active zone.
 
 ### Modified on_decode() Behavior
 
 ```
 Before:  no matching ctx + not signoff → append_ctx + generate_response(override=true)
-After:   no matching ctx + not signoff → check if mid-QSO (TX2/TX3):
-           if TX2/TX3: reject (DX not in our queue = we have no record of this QSO)
-           if TX1: allow (new QSO start, fresh context is correct)
+After:   no matching ctx → check message type:
+           TX4/TX5 (RR73/73): reject (signoff guard, as before)
+           TX3 (R+report): reject (snr_tx would be -99, reincarnation bug)
+           TX1/TX2/FD exchange: allow (fresh context gets correct metadata)
 ```
 
 ### Reincarnation Eliminated

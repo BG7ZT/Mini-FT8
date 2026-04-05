@@ -4052,12 +4052,8 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 if (!menu_edit_buf.empty()) menu_edit_buf.pop_back();
                 draw_menu_view();
                 if (menu_edit_idx == 7) {
-                  char* end = nullptr;
-                  long v = strtol(menu_edit_buf.c_str(), &end, 10);
-                  if (end != menu_edit_buf.c_str() && *end == '\0' && v >= 200 && v <= 3000) {
-                    g_offset_hz = (int)v;
-                    redraw_countdown_now();
-                  }
+                  g_offset_hz = atoi(menu_edit_buf.c_str());
+                  redraw_countdown_now();
                 }
               } else if (c == '`') {
                 if (menu_edit_idx == 7) {
@@ -4092,12 +4088,8 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 menu_edit_buf.push_back(ch);
                 draw_menu_view();
                 if (menu_edit_idx == 7) {
-                  char* end = nullptr;
-                  long v = strtol(menu_edit_buf.c_str(), &end, 10);
-                  if (end != menu_edit_buf.c_str() && *end == '\0' && v >= 200 && v <= 3000) {
-                    g_offset_hz = (int)v;
-                    redraw_countdown_now();
-                  }
+                  g_offset_hz = atoi(menu_edit_buf.c_str());
+                  redraw_countdown_now();
                 }
               }
               break;

@@ -704,8 +704,6 @@ static UIMode ui_mode = UIMode::RX;
 static int tx_page = 0;
 static std::vector<UiRxLine> g_rx_lines;
 static volatile bool g_tx_view_dirty = false;  // Set when autoseq state changes
-static volatile bool g_auto_switch_to_tx = false;  // Auto-switch to TX screen when transmitting
-static volatile bool g_auto_switch_to_rx = false;  // Auto-switch to RX screen when decodes arrive
 int64_t g_decode_slot_idx = -1; // set at decode trigger to tag RX lines with slot parity
 
 // State machine variables (matching reference project architecture)
@@ -902,6 +900,7 @@ static SemaphoreHandle_t log_mutex = NULL;                       // Protects log
 static int menu_page = 0;
 static int menu_edit_idx = -1;
 static std::string menu_edit_buf;
+static int menu_cursor_edit_original = 0;
 static bool menu_long_edit = false;
 static enum { LONG_NONE, LONG_FT, LONG_COMMENT, LONG_ACTIVE, LONG_IGNORE } menu_long_kind = LONG_NONE;
 static std::string menu_long_buf;
@@ -1544,7 +1543,7 @@ static const char* cq_type_name(CqType t) {
 static const char* offset_name(OffsetSrc o) {
   switch (o) {
     case OffsetSrc::RANDOM: return "Random";
-    case OffsetSrc::CURSOR: return "Cursor";
+    case OffsetSrc::CURSOR: return "Fixed";
     case OffsetSrc::RX: return "RX";
   }
   return "Random";
@@ -1815,6 +1814,15 @@ static void update_countdown() {
     last_slot_idx = slot_idx;
     last_sec = sec;
   }
+}
+
+static void redraw_countdown_now() {
+  int64_t now_ms = rtc_now_ms();
+  int64_t slot_idx = now_ms / 15000;
+  int64_t slot_ms = now_ms % 15000;
+  float frac = (float)slot_ms / 15000.0f;
+  bool even = (slot_idx % 2) == 0;
+  ui_draw_countdown(frac, even, g_offset_hz);
 }
 
 // Forward declarations for single-threaded TX state machine
@@ -2367,11 +2375,8 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
   merged.insert(merged.end(), to_me.begin(), to_me.end());
   merged.insert(merged.end(), cqs.begin(), cqs.end());
   merged.insert(merged.end(), others.begin(), others.end());
-  if (merged.size() > 12) merged.resize(12);
 
   g_rx_lines = merged;
-
-  if (!merged.empty()) g_auto_switch_to_rx = true;
 
   if (update_ui) {
     ui_set_rx_list(g_rx_lines);
@@ -2581,9 +2586,6 @@ static void tx_start(int skip_tones) {
     }
   }
 
-  // Auto-switch to TX screen when transmission starts
-  g_auto_switch_to_tx = true;
-
   if (skip_tones > 0) {
     ESP_LOGI("TXTONE", "Skipping first %d tones due to late start", skip_tones);
   }
@@ -2679,9 +2681,9 @@ static void draw_menu_view() {
 
   lines.push_back(std::string("Offset:") + offset_name(g_offset_src));
   if (menu_edit_idx == 7) {
-    lines.push_back(std::string("Cursor:") + menu_edit_buf);
+    lines.push_back(std::string("Fixed:") + menu_edit_buf);
   } else {
-    lines.push_back(std::string("Cursor:") + std::to_string(g_offset_hz));
+    lines.push_back(std::string("Fixed:") + std::to_string(g_offset_hz));
   }
   lines.push_back(std::string("Radio:") + radio_name(g_radio));
   lines.push_back(std::string("IgnoreList:") + head_trim(g_ignore_prefix_text, 10));
@@ -3629,24 +3631,6 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     }
 
     if (c == 0) {
-      // Auto-switch between RX and TX screens (only when in RX or TX mode)
-      if (g_auto_switch_to_tx && ui_mode == UIMode::RX) {
-        g_auto_switch_to_tx = false;
-        g_auto_switch_to_rx = false;  // Clear both to avoid ping-pong
-        enter_mode(UIMode::TX);
-        redraw_tx_view();
-      } else if (g_auto_switch_to_rx && ui_mode == UIMode::TX) {
-        g_auto_switch_to_rx = false;
-        g_auto_switch_to_tx = false;
-        enter_mode(UIMode::RX);
-        ui_force_redraw_rx();
-        ui_draw_rx();
-      } else {
-        // Clear flags if in other modes (don't interrupt MENU, BAND, etc.)
-        g_auto_switch_to_tx = false;
-        g_auto_switch_to_rx = false;
-      }
-
       if (g_rx_dirty && ui_mode == UIMode::RX) {
         ui_set_rx_list(g_rx_lines);
         ui_draw_rx(rx_flash_idx);
@@ -4057,7 +4041,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 // Absolute indices across pages
                 if (menu_edit_idx == 3) { g_call = menu_edit_buf; autoseq_set_station(g_call, g_grid); }
                 else if (menu_edit_idx == 4) { g_grid = menu_edit_buf; autoseq_set_station(g_call, g_grid); }
-                else if (menu_edit_idx == 7) { g_offset_hz = atoi(menu_edit_buf.c_str()); }
+                else if (menu_edit_idx == 7) { g_offset_hz = atoi(menu_edit_buf.c_str()); redraw_countdown_now(); }
                 else if (menu_edit_idx == 10) { g_comment1 = menu_edit_buf; }
                 else if (menu_edit_idx == 15) { g_rtc_comp = atoi(menu_edit_buf.c_str()); }
                 save_station_data();
@@ -4067,10 +4051,39 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
               } else if (c == 0x08 || c == 0x7f) {
                 if (!menu_edit_buf.empty()) menu_edit_buf.pop_back();
                 draw_menu_view();
+                if (menu_edit_idx == 7) {
+                  char* end = nullptr;
+                  long v = strtol(menu_edit_buf.c_str(), &end, 10);
+                  if (end != menu_edit_buf.c_str() && *end == '\0' && v >= 200 && v <= 3000) {
+                    g_offset_hz = (int)v;
+                    redraw_countdown_now();
+                  }
+                }
               } else if (c == '`') {
+                if (menu_edit_idx == 7) {
+                  g_offset_hz = menu_cursor_edit_original;
+                  redraw_countdown_now();
+                }
                 menu_edit_idx = -1;
                 menu_edit_buf.clear();
                 draw_menu_view();
+              } else if (menu_edit_idx == 7 && (c == ';' || c == '.' || c == ',' || c == '/')) {
+                // Arrow mode starts from the currently shown edit value.
+                int cursor_val = g_offset_hz;
+                if (!menu_edit_buf.empty()) {
+                  cursor_val = atoi(menu_edit_buf.c_str());
+                }
+                if (c == ';') cursor_val += 100;
+                else if (c == '.') cursor_val -= 100;
+                else if (c == ',') cursor_val -= 10;
+                else cursor_val += 10; // '/'
+                // Clamp applies only to arrow mode.
+                if (cursor_val < 200) cursor_val = 200;
+                if (cursor_val > 3000) cursor_val = 3000;
+                g_offset_hz = cursor_val;
+                menu_edit_buf = std::to_string(cursor_val);
+                draw_menu_view();
+                redraw_countdown_now();
               } else if (c >= 32 && c < 127) {
                 char ch = c;
                 if (menu_edit_idx % 6 == 3 || menu_edit_idx % 6 == 4 || menu_edit_idx % 6 == 5) {
@@ -4078,6 +4091,14 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 }
                 menu_edit_buf.push_back(ch);
                 draw_menu_view();
+                if (menu_edit_idx == 7) {
+                  char* end = nullptr;
+                  long v = strtol(menu_edit_buf.c_str(), &end, 10);
+                  if (end != menu_edit_buf.c_str() && *end == '\0' && v >= 200 && v <= 3000) {
+                    g_offset_hz = (int)v;
+                    redraw_countdown_now();
+                  }
+                }
               }
               break;
             }
@@ -4170,6 +4191,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                   draw_menu_view();
                 } else if (c == '2') {
                   menu_edit_idx = 7; // Cursor line
+                  menu_cursor_edit_original = g_offset_hz;
                   menu_edit_buf = std::to_string(g_offset_hz);
                   draw_menu_view();
                 } else if (c == '3') {

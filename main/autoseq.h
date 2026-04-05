@@ -5,8 +5,8 @@
 #include <functional>
 #include "ui.h"
 
-// Queue size: active + inactive entries. 120 supports a full 1-hour activation.
-constexpr int AUTOSEQ_MAX_QUEUE = 120;
+// Queue size: active + inactive entries.
+constexpr int AUTOSEQ_MAX_QUEUE = 30;
 // Maximum retries before moving to inactive zone
 constexpr int AUTOSEQ_MAX_RETRY = 5;
 

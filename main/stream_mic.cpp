@@ -71,7 +71,7 @@ void stream_mic_task(void* /*arg*/) {
   mon_cfg.f_max = 3000.0f;
   mon_cfg.sample_rate = FT8_SAMPLE_RATE;
   mon_cfg.time_osr = 1;
-  mon_cfg.freq_osr = 2;
+  mon_cfg.freq_osr = 1;
   mon_cfg.protocol = FTX_PROTOCOL_FT8;
 
   monitor_t mon;

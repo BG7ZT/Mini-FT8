@@ -566,7 +566,7 @@ static void stream_uac_task(void* arg) {
         .f_max = 3000.0f,
         .sample_rate = FT8_SAMPLE_RATE,
         .time_osr = 1,
-        .freq_osr = 2,
+        .freq_osr = 1,
         .protocol = FTX_PROTOCOL_FT8
     };
 

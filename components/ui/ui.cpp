@@ -21,6 +21,7 @@ static int rx_page = 0;
 static int rx_selected = -1;  // global index into rx_lines
 static std::vector<UiRxLine> last_drawn_lines;
 static int last_page = -1;
+static std::string g_visible_rows[RX_LINES];
 
 static SemaphoreHandle_t g_disp_mutex = nullptr;
 
@@ -69,6 +70,7 @@ void ui_draw_tx(const std::string& next, const std::vector<std::string>& queue, 
     M5.Display.setTextColor(next_color, TFT_BLACK);
     M5.Display.setCursor(0, start_y);
     M5.Display.printf("1 %s", next.c_str());
+    g_visible_rows[0] = std::string("1 ") + next;
 
     // Lines 2-6: queue items based on page
     int start_idx = page * 5; // show up to 5 items after next
@@ -88,6 +90,9 @@ void ui_draw_tx(const std::string& next, const std::vector<std::string>& queue, 
             M5.Display.setTextColor(fg, bg);
             M5.Display.setCursor(0, y);
             M5.Display.printf("%d %s", i + 2, queue[idx].c_str());
+            g_visible_rows[i + 1] = std::to_string(i + 2) + " " + queue[idx];
+        } else {
+            g_visible_rows[i + 1].clear();
         }
     }
     M5.Display.endWrite();
@@ -227,6 +232,10 @@ static void draw_rx_line(int y, const UiRxLine& l, int line_no, bool selected, b
     M5.Display.printf("%d ", line_no);
     M5.Display.setTextColor(color, bg);
     M5.Display.printf("%s", l.text.c_str());
+    int row_idx = line_no - 1;
+    if (row_idx >= 0 && row_idx < RX_LINES) {
+        g_visible_rows[row_idx] = std::to_string(line_no) + " " + l.text;
+    }
 }
 
 void ui_draw_rx(int flash_index) {
@@ -261,6 +270,8 @@ void ui_draw_rx(int flash_index) {
             bool selected = (idx == flash_index);
             bool more = (rx_page == 0 && rx_lines.size() > RX_LINES && i == RX_LINES - 1);
             draw_rx_line(y, rx_lines[idx], i + 1, selected, more);
+        } else {
+            g_visible_rows[i].clear();
         }
     }
     M5.Display.endWrite();
@@ -317,6 +328,9 @@ void ui_draw_list(const std::vector<std::string>& lines, int page, int highlight
             M5.Display.setTextColor(TFT_WHITE, bg);
             M5.Display.setCursor(0, y);
             M5.Display.printf("%d %s", i + 1, lines[idx].c_str());
+            g_visible_rows[i] = std::to_string(i + 1) + " " + lines[idx];
+        } else {
+            g_visible_rows[i].clear();
         }
     }
     M5.Display.endWrite();
@@ -336,9 +350,33 @@ void ui_draw_debug(const std::vector<std::string>& lines, int page) {
             M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
             M5.Display.setCursor(0, y);
             M5.Display.printf("%s", lines[idx].c_str());
+            g_visible_rows[i] = lines[idx];
+        } else {
+            g_visible_rows[i].clear();
         }
     }
     M5.Display.endWrite();
+}
+
+void ui_get_visible_text_lines(std::vector<std::string>& out) {
+    out.clear();
+    out.reserve(RX_LINES);
+    for (int i = 0; i < RX_LINES; ++i) {
+        out.push_back(g_visible_rows[i]);
+    }
+}
+
+void ui_set_visible_text_line(int row_idx, const std::string& text) {
+    if (row_idx < 0 || row_idx >= RX_LINES) return;
+    g_visible_rows[row_idx] = text;
+}
+
+void ui_get_rx_page_info(int& current_page, int& total_pages) {
+    total_pages = (int)rx_lines.size() <= 0 ? 1 : (((int)rx_lines.size() + RX_LINES - 1) / RX_LINES);
+    if (total_pages < 1) total_pages = 1;
+    current_page = rx_page + 1;
+    if (current_page < 1) current_page = 1;
+    if (current_page > total_pages) current_page = total_pages;
 }
 
 

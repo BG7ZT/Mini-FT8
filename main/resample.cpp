@@ -37,7 +37,7 @@ int convert_24bit_stereo_to_mono_float(
     return num_stereo_samples;
 }
 
-int resample_48k_to_12k(
+int resample_48k_to_6k(
     resample_state_t* state,
     const float* in,
     float* out,
@@ -115,7 +115,7 @@ int uac_pcm_to_ft8_samples(
             temp_mono[i] = mono / (float)channels;
         }
 
-        int out_count = resample_48k_to_12k(state, temp_mono, out_ptr, chunk);
+        int out_count = resample_48k_to_6k(state, temp_mono, out_ptr, chunk);
         in_ptr += chunk * frame_bytes;
         out_ptr += out_count;
         total_out += out_count;

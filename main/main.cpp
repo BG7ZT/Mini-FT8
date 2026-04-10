@@ -78,7 +78,7 @@ static bool g_ble_dump_in_progress = false;
 
 #endif
 #ifndef FT8_SAMPLE_RATE
-#define FT8_SAMPLE_RATE 12000
+#define FT8_SAMPLE_RATE 6000
 #endif
 
 #define BLE_UI_SVC_UUID   0xFFE0
@@ -1133,7 +1133,7 @@ static std::string g_free_text = "TNX 73";
 static std::string g_call = "YOURCALL";
 static std::string g_grid = "CM97";
 bool g_decode_enabled = true;
-int g_time_osr = 1;
+int g_time_osr = 2;
 int g_freq_osr = 1;
 static OffsetSrc g_offset_src = OffsetSrc::RANDOM;
 static RadioType g_radio = RadioType::QMX;
@@ -1779,7 +1779,7 @@ struct WAVHeader {
 
   monitor_config_t mon_cfg;
   mon_cfg.f_min = 200.0f;
-  mon_cfg.f_max = 3000.0f;
+  mon_cfg.f_max = 2900.0f;
   mon_cfg.sample_rate = FT8_SAMPLE_RATE;
   mon_cfg.time_osr = g_time_osr;
   mon_cfg.freq_osr = g_freq_osr;
@@ -3359,7 +3359,7 @@ static bool ble_dump_send_line(const std::string& raw) {
 }
 
 static void apply_ble_enabled_policy(bool runtime_apply) {
-  g_time_osr = g_ble_enabled ? 1 : 2;
+  g_time_osr = 2;  // 6kHz sample rate enables time_osr=2 even with BLE
   g_freq_osr = 1;
   if (!runtime_apply) return;
 
@@ -3759,7 +3759,7 @@ static bool ble_pop_input(BleUiInput& out) { (void)out; return false; }
 static void ble_update_name_from_station(bool restart_adv) { (void)restart_adv; }
 static void apply_ble_enabled_policy(bool runtime_apply) {
   (void)runtime_apply;
-  g_time_osr = g_ble_enabled ? 1 : 2;
+  g_time_osr = 2;  // 6kHz sample rate enables time_osr=2 always
   g_freq_osr = 1;
 }
 static void ble_mirror_tick() {}

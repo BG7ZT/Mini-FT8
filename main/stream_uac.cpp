@@ -37,7 +37,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
 int64_t rtc_now_ms();
 
 #ifndef FT8_SAMPLE_RATE
-#define FT8_SAMPLE_RATE 12000
+#define FT8_SAMPLE_RATE 6000
 #endif
 
 // Task priorities and stack sizes
@@ -565,7 +565,7 @@ static void stream_uac_task(void* arg) {
     // Initialize FT8 monitor
     monitor_config_t mon_cfg = {
         .f_min = 200.0f,
-        .f_max = 3000.0f,
+        .f_max = 2900.0f,
         .sample_rate = FT8_SAMPLE_RATE,
         .time_osr = g_time_osr,
         .freq_osr = g_freq_osr,
@@ -579,15 +579,15 @@ static void stream_uac_task(void* arg) {
     // Allocate buffers
     uint8_t* usb_buffer = (uint8_t*)heap_caps_malloc(UAC_READ_BUFFER_SIZE, MALLOC_CAP_DEFAULT);
     float* ft8_buffer = (float*)heap_caps_malloc(sizeof(float) * mon.block_size, MALLOC_CAP_DEFAULT);
-    // Intermediate 12kHz output buffer from PCM conversion/resampling.
-    float* temp_12k = (float*)heap_caps_malloc(sizeof(float) * 1024, MALLOC_CAP_DEFAULT);
+    // Intermediate 6kHz output buffer from PCM conversion/resampling.
+    float* temp_dec = (float*)heap_caps_malloc(sizeof(float) * 512, MALLOC_CAP_DEFAULT);
     log_heap("UAC_AFTER_FFT_ALLOC");
 
-    if (!usb_buffer || !ft8_buffer || !temp_12k) {
+    if (!usb_buffer || !ft8_buffer || !temp_dec) {
         ESP_LOGE(TAG, "Buffer allocation failed");
         if (usb_buffer) free(usb_buffer);
         if (ft8_buffer) free(ft8_buffer);
-        if (temp_12k) free(temp_12k);
+        if (temp_dec) free(temp_dec);
         monitor_free(&mon);
         s_stream_task_handle = NULL;
         vTaskDelete(NULL);
@@ -647,17 +647,17 @@ static void stream_uac_task(void* arg) {
 
         if (num_frames == 0) continue;
 
-        // Convert and resample selected USB PCM format -> 12kHz mono float.
-        int samples_12k = uac_pcm_to_ft8_samples(&s_resample_state, usb_buffer,
-                                                 (int)bytes_read, temp_12k,
+        // Convert and resample selected USB PCM format -> 6kHz mono float.
+        int samples_dec = uac_pcm_to_ft8_samples(&s_resample_state, usb_buffer,
+                                                 (int)bytes_read, temp_dec,
                                                  s_format.bit_resolution,
                                                  s_format.channels);
 
         // Accumulate into ft8_buffer
-        for (int i = 0; i < samples_12k && !s_stop_requested; i++) {
-            ft8_buffer[ft8_buffer_idx++] = temp_12k[i];
+        for (int i = 0; i < samples_dec && !s_stop_requested; i++) {
+            ft8_buffer[ft8_buffer_idx++] = temp_dec[i];
 
-            // When we have a full block (1920 samples = 160ms)
+            // When we have a full block (960 samples = 160ms at 6kHz)
             if (ft8_buffer_idx >= mon.block_size) {
                 // Apply gain normalization (same as stream_wav.cpp)
                 double acc = 0.0;
@@ -725,7 +725,7 @@ static void stream_uac_task(void* arg) {
     // Cleanup
     free(usb_buffer);
     free(ft8_buffer);
-    free(temp_12k);
+    free(temp_dec);
     monitor_free(&mon);
 
     g_streaming = false;

@@ -23,7 +23,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
 int64_t rtc_now_ms();
 
 #ifndef FT8_SAMPLE_RATE
-#define FT8_SAMPLE_RATE 12000
+#define FT8_SAMPLE_RATE 6000
 #endif
 
 static void push_waterfall_latest(const monitor_t& mon) {
@@ -70,7 +70,7 @@ void stream_mic_task(void* /*arg*/) {
 
   monitor_config_t mon_cfg;
   mon_cfg.f_min = 200.0f;
-  mon_cfg.f_max = 3000.0f;
+  mon_cfg.f_max = 2900.0f;
   mon_cfg.sample_rate = FT8_SAMPLE_RATE;
   mon_cfg.time_osr = g_time_osr;
   mon_cfg.freq_osr = g_freq_osr;

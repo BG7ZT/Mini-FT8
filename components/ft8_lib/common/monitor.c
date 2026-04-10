@@ -59,11 +59,17 @@ static void waterfall_init(ftx_waterfall_t* me, int max_blocks, int num_bins, in
     me->mag = waterfall_mag_buf;
 }
 
+// Static waterfall buffer — avoids heap fragmentation on ESP32 with BLE.
+// Sized for FT8 at 6kHz: max_blocks=93, time_osr=2, freq_osr=1, num_bins=433
+#define WF_STATIC_SIZE  (93 * 2 * 1 * 433)  // 80,538 bytes
+static WF_ELEM_T waterfall_static_buf[WF_STATIC_SIZE];
+static bool waterfall_is_static = false;
+
 static void waterfall_free(ftx_waterfall_t* me)
 {
     if (me && me->mag)
     {
-        free(me->mag);
+        if (!waterfall_is_static) free(me->mag);
         me->mag = NULL;
     }
 }
@@ -99,15 +105,25 @@ void monitor_init(monitor_t* me, const monitor_config_t* cfg)
         return;
     }
 
-    // Allocate waterfall next
+    // Allocate waterfall next — use static buffer to avoid heap fragmentation
     int block_stride = cfg->time_osr * cfg->freq_osr * num_bins;
     size_t wf_bytes = (size_t)max_blocks * block_stride * sizeof(WF_ELEM_T);
-    waterfall_mag_buf = (WF_ELEM_T*)malloc(wf_bytes);
-    if (waterfall_mag_buf == NULL)
+    if (wf_bytes <= sizeof(waterfall_static_buf))
     {
-        LOG(LOG_ERROR, "Waterfall alloc failed (%zu bytes)\n", wf_bytes);
-        monitor_free(me);
-        return;
+        waterfall_mag_buf = waterfall_static_buf;
+        waterfall_is_static = true;
+        LOG(LOG_INFO, "Waterfall using static buffer (%zu / %zu bytes)\n", wf_bytes, sizeof(waterfall_static_buf));
+    }
+    else
+    {
+        waterfall_mag_buf = (WF_ELEM_T*)malloc(wf_bytes);
+        waterfall_is_static = false;
+        if (waterfall_mag_buf == NULL)
+        {
+            LOG(LOG_ERROR, "Waterfall alloc failed (%zu bytes)\n", wf_bytes);
+            monitor_free(me);
+            return;
+        }
     }
 
     waterfall_init(&me->wf, max_blocks, num_bins, cfg->time_osr, cfg->freq_osr);

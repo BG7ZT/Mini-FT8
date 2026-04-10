@@ -3743,6 +3743,18 @@ static std::string trim_copy(const std::string& s) {
   return s.substr(b, e - b);
 }
 
+static void ascii_upper_inplace(std::string& s) {
+  for (auto& ch : s) {
+    ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+  }
+}
+
+static std::string trim_upper_copy(const std::string& s) {
+  std::string out = trim_copy(s);
+  ascii_upper_inplace(out);
+  return out;
+}
+
 static uint32_t parse_crc_hex(const std::string& hex) {
   if (hex.empty()) return 0;
   char* end = nullptr;
@@ -4127,17 +4139,17 @@ static void load_station_data() {
       if (val == (int)RadioType::KH1) g_radio = RadioType::KH1;
       else g_radio = RadioType::QMX;
     } else if (strncmp(line, "cq_ft=", 6) == 0) {
-      g_cq_freetext = trim_copy(line + 6);
+      g_cq_freetext = trim_upper_copy(line + 6);
     } else if (strncmp(line, "free_text=", 10) == 0) {
-      g_free_text = trim_copy(line + 10);
+      g_free_text = trim_upper_copy(line + 10);
     } else if (strncmp(line, "call=", 5) == 0) {
-      g_call = trim_copy(line + 5);
+      g_call = trim_upper_copy(line + 5);
     } else if (strncmp(line, "grid=", 5) == 0) {
-      g_grid = trim_copy(line + 5);
+      g_grid = trim_upper_copy(line + 5);
     } else if (strncmp(line, "comment1=", 9) == 0) {
       g_comment1 = trim_copy(line + 9);
     } else if (strncmp(line, "ignore_prefixes=", 16) == 0) {
-      g_ignore_prefix_text = clamp_ignore_prefix_text(trim_copy(line + 16));
+      g_ignore_prefix_text = clamp_ignore_prefix_text(trim_upper_copy(line + 16));
     } else if (sscanf(line, "rxtx_log=%d", &val) == 1) {
       g_rxtx_log = (val != 0);
     } else if (sscanf(line, "skiptx1=%d", &val) == 1) {
@@ -4145,7 +4157,7 @@ static void load_station_data() {
     } else if (sscanf(line, "active_band=%d", &val) == 1) { // legacy single value
       g_active_band_text = std::to_string(val);
     } else if (strncmp(line, "active_bands=", 13) == 0) {
-      g_active_band_text = trim_copy(line + 13);
+      g_active_band_text = trim_upper_copy(line + 13);
     } else if (sscanf(line, "autoseq_max_retry=%d", &val) == 1) {
       if (val >= 0) g_autoseq_max_retry = val;
     } else if (sscanf(line, "ble_enabled=%d", &val) == 1) {
@@ -4333,6 +4345,9 @@ static void ble_commit_text_input(const BleUiInput& input) {
   }
 
   if (menu_long_edit) {
+    if (menu_long_kind != LONG_COMMENT) {
+      ascii_upper_inplace(value);
+    }
     if (menu_long_kind == LONG_IGNORE && value.size() > kIgnorePrefixTextMaxLen) {
       value.resize(kIgnorePrefixTextMaxLen);
     }
@@ -4361,6 +4376,9 @@ static void ble_commit_text_input(const BleUiInput& input) {
   }
 
   if (menu_edit_idx >= 0) {
+    if (menu_edit_idx != 10) {
+      ascii_upper_inplace(value);
+    }
     if (menu_edit_idx == 7 && value.size() > 10) value.resize(10);
     if (menu_edit_idx == 15 && value.size() > 10) value.resize(10);
     menu_edit_buf = value;

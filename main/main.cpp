@@ -2444,6 +2444,16 @@ static void fft_waterfall_tx_tone(uint8_t tone) {
 }
 
 void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool update_ui) {
+  // ==== HEAP STRESS INSTRUMENTATION ====
+  size_t heap_entry  = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  size_t heap_entry_largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  size_t heap_entry_min = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+  UBaseType_t stack_hw_entry = uxTaskGetStackHighWaterMark(NULL);
+  ESP_LOGW(TAG, "DECODE_HEAP ENTER: free=%u largest=%u alltime_min=%u stack_hw=%u",
+           (unsigned)heap_entry, (unsigned)heap_entry_largest,
+           (unsigned)heap_entry_min, (unsigned)stack_hw_entry);
+  // ==== END INSTRUMENTATION ====
+
   const int max_cand = 50;
   static ftx_candidate_t candidates[max_cand];
   int num_candidates = ftx_find_candidates(&mon->wf, max_cand, candidates, 5);
@@ -2567,12 +2577,8 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
   time_offsets.reserve(32);
 
   if (num_candidates <= 0) {
-    ESP_LOGW(TAG, "No candidates found");
-    g_rx_lines.clear();
-    if (update_ui) { ui_set_rx_list(g_rx_lines); ui_draw_rx(); }
-    else g_rx_dirty = true;
-    g_decode_in_progress = false;  // Clear flag before early return
-    return;
+    ESP_LOGW(TAG, "No candidates found (injection will fill)");
+    // NOTE: early return removed for heap stress test — fall through to injection
   }
 
   int decodedCount = 0;
@@ -2711,6 +2717,39 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     if (decodedCount >= 32) break;
   }
 
+  // ==== HEAP STRESS INJECTION: pad to 32 fake CQ messages ====
+  {
+    static const char* fake_calls[] = {
+      "W1AW", "K2XX", "N3LLO", "W4EEE", "K5ZZZ", "N6BBB", "W7CCC",
+      "K8DDD", "N9FFF", "W0GGG", "VE3ABC", "VK2DEF", "JA1GHI",
+      "G3JKL", "DL5MNO", "F6PQR", "EA7STU", "I8VWX", "OH9YZZ",
+      "ZL2AAA", "PY1BBB", "LU3CCC", "CE4DDD", "HL5EEE", "HS7FFF",
+      "9A1GGG", "YU2HHH", "OK3III", "SP4JJJ", "UA6KKK", "SV9LLL",
+      "OZ5MMM"
+    };
+    int fake_idx = 0;
+    while (decodedCount < 32 && fake_idx < 32) {
+      char fake_text[64];
+      snprintf(fake_text, sizeof(fake_text), "CQ %s AB%02d",
+               fake_calls[fake_idx], fake_idx);
+      UiRxLine line;
+      line.text = fake_text;
+      line.snr = -10 + (fake_idx % 20);
+      line.offset_hz = 500 + fake_idx * 75;
+      line.slot_id = slot_id;
+      fill_fields_from_text(line);
+      line.is_cq = true;
+      ui_lines.push_back(line);
+      seen_idx[line.text] = (int)ui_lines.size() - 1;
+      log_rxtx_line('R', line.snr, line.offset_hz, line.text, -1);
+      decodedCount++;
+      fake_idx++;
+    }
+    ESP_LOGW(TAG, "HEAP_STRESS: injected %d fake CQs, total decoded=%d",
+             fake_idx, decodedCount);
+  }
+  // ==== END INJECTION ====
+
   if (decodedCount == 0) {
     ESP_LOGW(TAG, "Candidates present but no messages decoded");
   }
@@ -2811,6 +2850,19 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     //snprintf(buf, sizeof(buf), "HashTableSize %d", callsign_hashtable_size);
     //debug_log_line_public(buf);
 #endif
+
+  // ==== HEAP STRESS INSTRUMENTATION (exit) ====
+  {
+    size_t heap_exit  = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    size_t heap_exit_largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    size_t heap_exit_min = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+    UBaseType_t stack_hw_exit = uxTaskGetStackHighWaterMark(NULL);
+    ESP_LOGW(TAG, "DECODE_HEAP EXIT: free=%u largest=%u alltime_min=%u stack_hw=%u (delta_free=%d)",
+             (unsigned)heap_exit, (unsigned)heap_exit_largest,
+             (unsigned)heap_exit_min, (unsigned)stack_hw_exit,
+             (int)heap_exit - (int)heap_entry);
+  }
+  // ==== END INSTRUMENTATION ====
 
   g_decode_in_progress = false;  // Allow TX trigger now that decode is complete
 }

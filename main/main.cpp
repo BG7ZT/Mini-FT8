@@ -56,7 +56,7 @@ extern "C" {
 #include "sdmmc_cmd.h"
 #include "esp_vfs_fat.h"
 
-static const char* STATION_FILE = "/spiffs/Station.ini";
+static const char* STATION_FILE = "/spiffs/Station.txt";
 static sdmmc_card_t* g_sd_card = NULL;
 static bool g_sd_mounted = false;
 static bool g_ble_enabled = true;
@@ -500,8 +500,8 @@ static void build_rxtx_log_path(char* path, size_t path_sz) {
   struct tm t;
   localtime_r(&now, &t);
 
-  // RT[YYMMDD].log
-  snprintf(path, path_sz, "/spiffs/RT%02d%02d%02d.log",
+  // RT[YYMMDD].txt
+  snprintf(path, path_sz, "/spiffs/RT%02d%02d%02d.txt",
            (t.tm_year + 1900) % 100,
            (t.tm_mon + 1) % 100,
            t.tm_mday % 100);
@@ -512,27 +512,27 @@ static bool file_exists(const char* path) {
   return (stat(path, &st) == 0) && S_ISREG(st.st_mode);
 }
 
-static void sync_station_ini_from_sd_to_spiffs() {
+static void sync_station_txt_from_sd_to_spiffs() {
   static const char* TAG = "FT8";
 
   if (ensure_sdcard_mounted() != ESP_OK) {
-    ESP_LOGI(TAG, "SD not mounted, using SPIFFS Station.ini");
+    ESP_LOGI(TAG, "SD not mounted, using SPIFFS Station.txt");
     return;
   }
 
-  const char* sd_path = "/sdcard/Station.ini";
-  const char* spiffs_path = "/spiffs/Station.ini";
+  const char* sd_path = "/sdcard/Station.txt";
+  const char* spiffs_path = "/spiffs/Station.txt";
 
   if (!file_exists(sd_path)) {
-    ESP_LOGI(TAG, "No Station.ini on SD, using SPIFFS Station.ini");
+    ESP_LOGI(TAG, "No Station.txt on SD, using SPIFFS Station.txt");
     unmount_sd_spi("/sdcard");
     return;
   }
 
   if (copy_file_overwrite(sd_path, spiffs_path) == ESP_OK) {
-    ESP_LOGI(TAG, "Copied Station.ini from SD to SPIFFS");
+    ESP_LOGI(TAG, "Copied Station.txt from SD to SPIFFS");
   } else {
-    ESP_LOGW(TAG, "Failed to copy Station.ini from SD, using SPIFFS Station.ini");
+    ESP_LOGW(TAG, "Failed to copy Station.txt from SD, using SPIFFS Station.txt");
   }
 
   unmount_sd_spi("/sdcard");
@@ -612,7 +612,7 @@ static esp_err_t copy_logs_spiffs_to_sd_overwrite() {
   unmount_sd_spi("/sdcard");
   return last_err;
 }
-// Delete all regular files on SPIFFS, except Station.ini.
+// Delete all regular files on SPIFFS, except Station.txt.
 static esp_err_t delete_logs_on_spiffs_keep_stationdata() {
   DIR* d = opendir("/spiffs");
   if (!d) return ESP_FAIL;
@@ -621,7 +621,7 @@ static esp_err_t delete_logs_on_spiffs_keep_stationdata() {
   while ((ent = readdir(d)) != nullptr) {
     const char* name = ent->d_name;
     if (!name || name[0] == '.') continue;
-    if (strcmp(name, "Station.ini") == 0) continue;
+    if (strcmp(name, "Station.txt") == 0) continue;
     std::string path = std::string("/spiffs/") + name;
     struct stat st;
     if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) continue;
@@ -992,6 +992,9 @@ static std::vector<QsoLogEntry> g_q_entries;
 static bool g_q_show_entries = false;
 static int q_page = 0;
 static std::string g_q_current_file;
+static std::vector<std::string> g_d_lines;
+static std::vector<std::string> g_d_files;
+static int d_page = 0;
 static std::string host_input;
 static const char* HOST_PROMPT = "MINIFT8> ";
 static bool usb_ready = false;
@@ -1098,8 +1101,10 @@ static int64_t s_last_tx_slot_idx = -1000;  // Track last TX slot for retry sche
 [[maybe_unused]] static bool g_sync_pending = false;
 [[maybe_unused]] static int g_sync_delta_ms = 0;
 static void enqueue_beacon_cq();
+static void load_spiffs_regular_files(std::vector<std::string>& files);
 static void qso_load_file_list();
 static void qso_load_fetch_file_list();
+static void delete_load_file_list();
 static void qso_load_entries(const std::string& path);
 static void qso_draw_page();
 
@@ -1252,7 +1257,7 @@ static void log_cabrillo_fd_entry(const std::string& dxcall, const std::string& 
   // Frequency: use selected band dial frequency (kHz)
   int freq_khz = (int)g_bands[g_band_sel].freq;
 
-  const char* path = "/spiffs/fieldday.log";
+  const char* path = "/spiffs/fieldday.txt";
 
   std::string location = fd_get_section_from_exchange(my_fd);
   cabrillo_fd_ensure_header(path, g_call, location);
@@ -1317,27 +1322,35 @@ static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& t
   xSemaphoreGive(log_mutex);
 }
 
+static bool is_daily_qso_txt_file(const char* name) {
+  if (!name) return false;
+  if (strlen(name) != 12) return false;  // YYYYMMDD.txt
+  for (int i = 0; i < 8; ++i) {
+    if (!std::isdigit(static_cast<unsigned char>(name[i]))) return false;
+  }
+  return std::strcmp(name + 8, ".txt") == 0;
+}
+
 static void qso_load_file_list() {
   g_q_files.clear();
   g_q_entries.clear();
   g_q_lines.clear();
   DIR* dir = opendir("/spiffs");
   if (!dir) {
-    g_q_lines.push_back("No ADIF logs");
+    g_q_lines.push_back("No QSO logs");
     return;
   }
   struct dirent* ent;
   while ((ent = readdir(dir)) != nullptr) {
     const char* name = ent->d_name;
-    size_t len = strlen(name);
-    if (len >= 4 && strcasecmp(name + len - 4, ".adi") == 0) {
+    if (is_daily_qso_txt_file(name)) {
       g_q_files.emplace_back(name);
     }
   }
   closedir(dir);
   std::sort(g_q_files.begin(), g_q_files.end(), std::greater<std::string>());
   if (g_q_files.empty()) {
-    g_q_lines.push_back("No ADIF logs");
+    g_q_lines.push_back("No QSO logs");
     return;
   }
   for (size_t i = 0; i < g_q_files.size(); ++i) {
@@ -1345,15 +1358,10 @@ static void qso_load_file_list() {
   }
 }
 
-static void qso_load_fetch_file_list() {
-  g_q_files.clear();
-  g_q_entries.clear();
-  g_q_lines.clear();
+static void load_spiffs_regular_files(std::vector<std::string>& files) {
+  files.clear();
   DIR* dir = opendir("/spiffs");
-  if (!dir) {
-    g_q_lines.push_back("No SPIFFS files");
-    return;
-  }
+  if (!dir) return;
   struct dirent* ent;
   while ((ent = readdir(dir)) != nullptr) {
     const char* name = ent->d_name;
@@ -1361,10 +1369,30 @@ static void qso_load_fetch_file_list() {
     std::string path = std::string("/spiffs/") + name;
     struct stat st;
     if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) continue;
-    g_q_files.emplace_back(name);
+    files.emplace_back(name);
   }
   closedir(dir);
-  std::sort(g_q_files.begin(), g_q_files.end(), std::greater<std::string>());
+  std::sort(files.begin(), files.end(), std::greater<std::string>());
+}
+
+static void delete_load_file_list() {
+  g_d_files.clear();
+  g_d_lines.clear();
+  load_spiffs_regular_files(g_d_files);
+  if (g_d_files.empty()) {
+    g_d_lines.push_back("No SPIFFS files");
+    return;
+  }
+  for (size_t i = 0; i < g_d_files.size(); ++i) {
+    g_d_lines.push_back(std::string("DELETE ") + g_d_files[i]);
+  }
+}
+
+static void qso_load_fetch_file_list() {
+  g_q_files.clear();
+  g_q_entries.clear();
+  g_q_lines.clear();
+  load_spiffs_regular_files(g_q_files);
   if (g_q_files.empty()) {
     g_q_lines.push_back("No SPIFFS files");
     return;
@@ -1521,7 +1549,7 @@ static void log_adif_entry(const std::string& dxcall, const std::string& dxgrid,
   int day = t.tm_mday;
   snprintf(date, sizeof(date), "%04d%02d%02d", year % 10000, month % 100, day % 100);
   char path[64];
-  snprintf(path, sizeof(path), "/spiffs/%s.adi", date);
+  snprintf(path, sizeof(path), "/spiffs/%s.txt", date);
 
   bool need_header = false;
   struct stat st;
@@ -3111,9 +3139,7 @@ static void debug_update_app_core0_stack_hud(bool redraw_now) {
                 (unsigned long)g_app_core0_stack_min_free_bytes);
   g_debug_lines[0] = cur_line;
   g_debug_lines[1] = min_line;
-  if (redraw_now && ui_mode == UIMode::DEBUG) {
-    ui_draw_debug(g_debug_lines, debug_page);
-  }
+  (void)redraw_now;
 }
 
 static void debug_log_line(const std::string& msg) {
@@ -3127,9 +3153,6 @@ static void debug_log_line(const std::string& msg) {
   }
   g_debug_lines.push_back(msg);
   debug_page = (int)((g_debug_lines.size() - 1) / 6);
-  if (ui_mode == UIMode::DEBUG) {
-    ui_draw_debug(g_debug_lines, debug_page);
-  }
 }
 
 #if ENABLE_BLE
@@ -3321,7 +3344,7 @@ static const char* ble_page_label(UIMode mode) {
     case UIMode::BAND: return "BAND";
     case UIMode::MENU: return "MENU";
     case UIMode::CONTROL: return "CONTROL";
-    case UIMode::DEBUG: return "DEBUG";
+    case UIMode::DEBUG: return "DELETE";
     case UIMode::STATUS: return "STATUS";
     case UIMode::QSO: return "QSO";
   }
@@ -3348,8 +3371,8 @@ static void ble_page_meta(int& cur, int& total) {
       cur = menu_page + 1;
       break;
     case UIMode::DEBUG:
-      total = page_count((int)g_debug_lines.size(), 6);
-      cur = debug_page + 1;
+      total = page_count((int)g_d_lines.size(), 6);
+      cur = d_page + 1;
       break;
     case UIMode::QSO:
       total = page_count((int)g_q_lines.size(), 6);
@@ -4011,9 +4034,8 @@ static void poll_host_uart() {
 }
 
 static void load_station_data() {
-  // If Station.ini exists on SD, prefer it by copying onto SPIFFS first.
-  // If mount/copy fails, fall back to the on-device SPIFFS Station.ini.
-  sync_station_ini_from_sd_to_spiffs();
+  // Sync only Station.txt from SD to SPIFFS (no legacy fallback).
+  sync_station_txt_from_sd_to_spiffs();
 
   // Load-time defaults for fixed/runtime settings.
   g_rtc_comp = kRtcCompFixed;
@@ -4186,8 +4208,9 @@ static void enter_mode(UIMode new_mode) {
       draw_menu_view();
       break;
     case UIMode::DEBUG:
-      debug_page = (int)((g_debug_lines.size() - 1) / 6);
-      ui_draw_debug(g_debug_lines, debug_page);
+      d_page = 0;
+      delete_load_file_list();
+      ui_draw_list(g_d_lines, d_page, -1);
       break;
     case UIMode::CONTROL:
       ui_draw_list(g_ctrl_lines, 0, -1);
@@ -4958,9 +4981,27 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
           }
         case UIMode::DEBUG: {
           if (c == ';') {
-            if (debug_page > 0) { debug_page--; ui_draw_debug(g_debug_lines, debug_page); }
+            if (d_page > 0) { d_page--; ui_draw_list(g_d_lines, d_page, -1); }
           } else if (c == '.') {
-            if ((debug_page + 1) * 6 < (int)g_debug_lines.size()) { debug_page++; ui_draw_debug(g_debug_lines, debug_page); }
+            if ((d_page + 1) * 6 < (int)g_d_lines.size()) { d_page++; ui_draw_list(g_d_lines, d_page, -1); }
+          } else if (c >= '1' && c <= '6') {
+            int idx = d_page * 6 + (c - '1');
+            if (idx >= 0 && idx < (int)g_d_files.size()) {
+              std::string deleted = g_d_files[idx];
+              std::string path = std::string("/spiffs/") + deleted;
+              if (unlink(path.c_str()) == 0) {
+                debug_log_line(std::string("Deleted: ") + deleted);
+              } else {
+                debug_log_line(std::string("Delete failed: ") + deleted);
+              }
+              delete_load_file_list();
+              int max_page = 0;
+              if (!g_d_lines.empty()) {
+                max_page = ((int)g_d_lines.size() - 1) / 6;
+              }
+              if (d_page > max_page) d_page = max_page;
+              ui_draw_list(g_d_lines, d_page, -1);
+            }
           }
           break;
         }

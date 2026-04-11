@@ -1912,6 +1912,34 @@ static std::string clamp_ignore_prefix_text(const std::string& s) {
   return s.substr(0, kIgnorePrefixTextMaxLen);
 }
 
+static std::string normalize_time_hms(const std::string& src) {
+  int h = 0, m = 0, s = 0;
+  if (sscanf(src.c_str(), "%d:%d:%d", &h, &m, &s) == 3) {
+    if (h >= 0 && h <= 23 && m >= 0 && m <= 59 && s >= 0 && s <= 59) {
+      char out[16];
+      snprintf(out, sizeof(out), "%02d:%02d:%02d", h, m, s);
+      return out;
+    }
+  }
+
+  std::string digits;
+  digits.reserve(src.size());
+  for (unsigned char ch : src) {
+    if (std::isdigit(ch)) digits.push_back((char)ch);
+  }
+  if (digits.size() >= 6) {
+    h = (digits[0] - '0') * 10 + (digits[1] - '0');
+    m = (digits[2] - '0') * 10 + (digits[3] - '0');
+    s = (digits[4] - '0') * 10 + (digits[5] - '0');
+    if (h >= 0 && h <= 23 && m >= 0 && m <= 59 && s >= 0 && s <= 59) {
+      char out[16];
+      snprintf(out, sizeof(out), "%02d:%02d:%02d", h, m, s);
+      return out;
+    }
+  }
+  return src;
+}
+
 static std::string menu_sleep_batt_line() {
   int level = (int)M5.Power.getBatteryLevel();
   if (level < 0 || level > 100) level = 0;
@@ -4011,7 +4039,7 @@ static void load_station_data() {
     } else if (sscanf(line, "date=%63s", line) == 1) {
       g_date = line;
     } else if (sscanf(line, "time=%63s", line) == 1) {
-      g_time = line;
+      g_time = normalize_time_hms(line);
     } else if (sscanf(line, "cq_type=%d", &val) == 1) {
       if (val >= 0 && val <= 5) g_cq_type = (CqType)val;
     } else if (sscanf(line, "offset_src=%d", &val) == 1) {
@@ -4309,7 +4337,7 @@ static void ble_commit_text_input(const BleUiInput& input) {
     if (value.size() > max_len) value.resize(max_len);
     status_edit_buffer = value;
     if (status_edit_idx == 4) g_date = status_edit_buffer;
-    else g_time = status_edit_buffer;
+    else g_time = normalize_time_hms(status_edit_buffer);
     save_station_data();
     rtc_set_from_strings();
     rtc_sync_to_hw();  // Persist to hardware RTC
@@ -4890,7 +4918,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                   draw_status_view();
                 } else if (c == '\n') {
                   if (status_edit_idx == 4) g_date = status_edit_buffer;
-                  else g_time = status_edit_buffer;
+                  else g_time = normalize_time_hms(status_edit_buffer);
                   save_station_data();
                   rtc_set_from_strings();
                   rtc_sync_to_hw();  // Persist to hardware RTC

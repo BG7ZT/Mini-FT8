@@ -1595,13 +1595,15 @@ static void ensure_usb() {
   }
 }
 
-static bool uart0_last_was_cr = false;
+static bool uart_inject_last_was_cr = false;
 
-static void poll_uart0_keys() {
+static void poll_uart_inject_keys() {
   if (!s_key_inject_queue) return;
-  // Read directly from UART0 hardware FIFO — no driver needed.
-  // The console (sdkconfig) already has UART0 configured on TX=GPIO1, RX=GPIO2.
-  uart_dev_t *hw = UART_LL_GET_HW(0);
+  // Read directly from the console UART FIFO — no driver needed.
+  // sdkconfig configures ESP console on UART1 TX=GPIO13, RX=GPIO15.
+  // We read the same UART1 RX FIFO here so one UART-to-USB adapter
+  // wired to G13/G15 serves both ESP_LOG output and key injection.
+  uart_dev_t *hw = UART_LL_GET_HW(1);
   while (true) {
     uint32_t avail = uart_ll_get_rxfifo_len(hw);
     if (avail == 0) break;
@@ -1614,11 +1616,11 @@ static void poll_uart0_keys() {
       if (ch == '\r') {
         char enter = '\n';
         xQueueSend(s_key_inject_queue, &enter, 0);
-        uart0_last_was_cr = true;
-      } else if (ch == '\n' && uart0_last_was_cr) {
-        uart0_last_was_cr = false;  // skip LF after CR
+        uart_inject_last_was_cr = true;
+      } else if (ch == '\n' && uart_inject_last_was_cr) {
+        uart_inject_last_was_cr = false;  // skip LF after CR
       } else {
-        uart0_last_was_cr = false;
+        uart_inject_last_was_cr = false;
         xQueueSend(s_key_inject_queue, &ch, 0);
       }
     }
@@ -4439,8 +4441,8 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     } else if (state.enter) {
       c = '\n';  // enter/return
     }
-    // Merge injected keys from UART0 RX
-    poll_uart0_keys();
+    // Merge injected keys from UART1 RX (console UART on G13/G15)
+    poll_uart_inject_keys();
     if (c == 0 && s_key_inject_queue) {
       char injected = 0;
       if (xQueueReceive(s_key_inject_queue, &injected, 0) == pdTRUE) {

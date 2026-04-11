@@ -3095,15 +3095,24 @@ static void draw_menu_view() {
   }
 }
 
+static std::string status_sync_line() {
+  const bool streaming = audio_source_is_streaming();
+  const RadioType radio = canonical_radio_type(g_radio);
+  if (radio == RadioType::KH1) {
+    const bool cat_ready = radio_control_ready();
+    if (cat_ready && streaming) return "Sync to KH1(RX+TX)";
+    if (cat_ready && !streaming) return "Sync to KH1(TX)";
+    return "Connect to KH1";
+  }
+  if (streaming) return std::string("Sync to ") + radio_name(radio);
+  return std::string("Connect to ") + radio_name(radio);
+}
+
 static void draw_status_view() {
   std::string lines[6];
   BeaconMode disp_beacon = (ui_mode == UIMode::STATUS) ? g_status_beacon_temp : g_beacon;
   lines[0] = std::string("Beacon: ") + beacon_name(disp_beacon);
-  if (audio_source_is_streaming()) {
-    lines[1] = std::string("Sync to ") + radio_name(g_radio);
-  } else {
-    lines[1] = std::string("Connect to ") + radio_name(g_radio);
-  }
+  lines[1] = status_sync_line();
   lines[2] = std::string("Band: ") +
              std::string(g_bands[g_band_sel].name) + " " +
              std::to_string(g_bands[g_band_sel].freq);
@@ -4652,15 +4661,19 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     redraw_tx_view();
   }
 
-  static int last_status_uac = -1; // -1 forces a redraw on first entry
-  int cur_uac = audio_source_is_streaming() ? 1 : 0;
-  if (ui_mode == UIMode::STATUS && cur_uac != last_status_uac) {
+  static int last_status_sync_sig = -1; // -1 forces a redraw on first entry
+  int cur_status_sync_sig = audio_source_is_streaming() ? 1 : 0;
+  if (canonical_radio_type(g_radio) == RadioType::KH1) {
+    cur_status_sync_sig |= 2;
+    if (radio_control_ready()) cur_status_sync_sig |= 4;
+  }
+  if (ui_mode == UIMode::STATUS && cur_status_sync_sig != last_status_sync_sig) {
     draw_status_view();
   }
   if (ui_mode != UIMode::STATUS) {
-    last_status_uac = -1;
+    last_status_sync_sig = -1;
   } else {
-    last_status_uac = cur_uac;
+    last_status_sync_sig = cur_status_sync_sig;
   }
 
   // Ensure decode is enabled whenever streaming becomes active.
@@ -4892,10 +4905,13 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 esp_err_t rc = radio_control_on_audio_start();
                 debug_log_line(rc == ESP_OK ? "UAC2 catok" : "UAC2 catng");
               }
-            } else {
-              int freq_hz = g_bands[g_band_sel].freq * 1000;
+            }
+            int freq_hz = g_bands[g_band_sel].freq * 1000;
+            if (radio_control_ready()) {
               bool ok = (radio_control_sync_frequency_mode(freq_hz) == ESP_OK);
-              debug_log_line(ok ? "CAT sync sent" : "CAT not ready");
+              debug_log_line(ok ? "CAT sync sent" : "CAT sync failed");
+            } else {
+              debug_log_line("CAT not ready");
             }
             status_edit_idx = -1;
             draw_status_view();

@@ -84,14 +84,16 @@ int uac_pcm_to_ft8_samples(
     int total_frames = in_bytes / frame_bytes;
     if (total_frames <= 0) return 0;
 
-    static float temp_mono[4096];
+    // USB UAC delivers 768 stereo samples per transfer (4608 bytes / 6 bytes).
+    // 1024 samples gives comfortable headroom without wasting BSS.
+    static float temp_mono[1024];
     int total_out = 0;
     const uint8_t* in_ptr = in;
     float* out_ptr = out;
     int remaining = total_frames;
 
     while (remaining > 0) {
-        int chunk = (remaining > 4096) ? 4096 : remaining;
+        int chunk = (remaining > 1024) ? 1024 : remaining;
 
         for (int i = 0; i < chunk; ++i) {
             const uint8_t* frame = in_ptr + i * frame_bytes;

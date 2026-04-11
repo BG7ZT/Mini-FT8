@@ -946,7 +946,10 @@ static const char* TAG = "FT8";
 enum class UIMode { RX, TX, BAND, MENU, CONTROL, DEBUG, STATUS, QSO };
 static UIMode ui_mode = UIMode::RX;
 static int tx_page = 0;
-static std::vector<UiRxLine> g_rx_lines;
+// NOTE: previous `std::vector<UiRxLine> g_rx_lines` was removed to eliminate
+// the last heap allocation in the decode/display path. The RX list now lives
+// as a static RxDecodeEntry array inside ui.cpp, populated via
+// ui_set_rx_list_static() and read back via ui_get_rx_entry()/ui_get_rx_count().
 static volatile bool g_tx_view_dirty = false;  // Set when autoseq state changes
 int64_t g_decode_slot_idx = -1; // set at decode trigger to tag RX lines with slot parity
 
@@ -2444,22 +2447,12 @@ static void fft_waterfall_tx_tone(uint8_t tone) {
 }
 
 // ---- Static decode workspace (zero heap allocation) ----
-#define DEC_MAX       32
-#define DEC_TEXT_MAX  FTX_MAX_MESSAGE_LENGTH   // 64
-#define DEC_FIELD_MAX 20
-
-struct DecodeMsg {
-  char text[DEC_TEXT_MAX];
-  char field1[DEC_FIELD_MAX];
-  char field2[DEC_FIELD_MAX];
-  char field3[DEC_FIELD_MAX];
-  int  snr;
-  int  offset_hz;
-  int  slot_id;
-  float time_s;
-  bool is_cq;
-  bool is_to_me;
-};
+// Use the shared RxDecodeEntry type from ui.h so we can hand it directly
+// to ui_set_rx_list_static without any conversion.
+#define DEC_MAX       RX_MAX_DECODES       // 32
+#define DEC_TEXT_MAX  RX_TEXT_MAX          // 64
+#define DEC_FIELD_MAX RX_FIELD_MAX         // 20
+typedef RxDecodeEntry DecodeMsg;
 
 static DecodeMsg s_dec[DEC_MAX];
 static int       s_dec_count;
@@ -2607,8 +2600,8 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
 
   if (num_candidates <= 0) {
     ESP_LOGW(TAG, "No candidates found");
-    g_rx_lines.clear();
-    if (update_ui) { ui_set_rx_list(g_rx_lines); ui_draw_rx(); }
+    ui_set_rx_list_static(nullptr, 0);
+    if (update_ui) { ui_draw_rx(); }
     else g_rx_dirty = true;
     g_decode_in_progress = false;
     return;
@@ -2833,25 +2826,10 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     }
   }
 
-  // ---- Single pass: static array → g_rx_lines (one heap allocation) ----
-  g_rx_lines.clear();
-  g_rx_lines.reserve(s_dec_count);
-  for (int i = 0; i < s_dec_count; ++i) {
-    UiRxLine rx;
-    rx.text      = s_dec[i].text;
-    rx.field1    = s_dec[i].field1;
-    rx.field2    = s_dec[i].field2;
-    rx.field3    = s_dec[i].field3;
-    rx.snr       = s_dec[i].snr;
-    rx.offset_hz = s_dec[i].offset_hz;
-    rx.slot_id   = s_dec[i].slot_id;
-    rx.is_cq     = s_dec[i].is_cq;
-    rx.is_to_me  = s_dec[i].is_to_me;
-    g_rx_lines.push_back(std::move(rx));
-  }
+  // ---- Zero-heap handoff: static s_dec[] → ui.cpp's static rx_lines[] ----
+  ui_set_rx_list_static(s_dec, s_dec_count);
 
   if (update_ui) {
-    ui_set_rx_list(g_rx_lines);
     ui_draw_rx();
     char buf[64];
     snprintf(buf, sizeof(buf), "Heap %u", heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
@@ -4706,7 +4684,8 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
 
     if (c == 0) {
       if (g_rx_dirty && ui_mode == UIMode::RX) {
-        ui_set_rx_list(g_rx_lines);
+        // decode_monitor_results already called ui_set_rx_list_static(),
+        // so UI's internal list is current. Just redraw.
         ui_draw_rx(rx_flash_idx);
         g_rx_dirty = false;
       }
@@ -4773,7 +4752,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
   }
 
   if (g_rx_dirty && ui_mode == UIMode::RX) {
-      ui_set_rx_list(g_rx_lines);
+      // decode already populated ui.cpp's internal list via ui_set_rx_list_static
       ui_draw_rx(rx_flash_idx);
       g_rx_dirty = false;
   }
@@ -4869,9 +4848,22 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     switch (ui_mode) {
       case UIMode::RX: {
         int sel = ui_handle_rx_key(c);
-        if (sel >= 0 && sel < (int)g_rx_lines.size()) {
-          // User tapped on a decoded message - let autoseq handle it
-          autoseq_on_touch(g_rx_lines[sel]);
+        RxDecodeEntry tapped;
+        if (sel >= 0 && ui_get_rx_entry(sel, &tapped)) {
+          // Convert static entry to UiRxLine for the autoseq API.
+          // This is on user tap (not in hot path), so the temporary
+          // std::string allocations are fine.
+          UiRxLine msg;
+          msg.text      = tapped.text;
+          msg.field1    = tapped.field1;
+          msg.field2    = tapped.field2;
+          msg.field3    = tapped.field3;
+          msg.snr       = tapped.snr;
+          msg.offset_hz = tapped.offset_hz;
+          msg.slot_id   = tapped.slot_id;
+          msg.is_cq     = tapped.is_cq;
+          msg.is_to_me  = tapped.is_to_me;
+          autoseq_on_touch(msg);
           g_tx_view_dirty = true;
           // Set TX flags - actual TX at slot boundary
           AutoseqTxEntry pending;

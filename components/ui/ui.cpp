@@ -16,15 +16,19 @@ static uint8_t waterfall[WATERFALL_H][SCREEN_W];
 static int waterfall_head = 0;
 static bool waterfall_dirty = false;
 
-static std::vector<UiRxLine> rx_lines;
+// Static RX list — zero-heap display pipeline
+static RxDecodeEntry rx_lines[RX_MAX_DECODES];
+static int rx_lines_count = 0;
 static int rx_page = 0;
 static int rx_selected = -1;  // global index into rx_lines
 struct RxDrawCacheEntry {
-    std::string text;
-    bool is_cq = false;
-    bool is_to_me = false;
+    char text[RX_TEXT_MAX];
+    bool is_cq;
+    bool is_to_me;
+    bool valid;
 };
-static std::vector<RxDrawCacheEntry> last_drawn_cache;
+static RxDrawCacheEntry last_drawn_cache[RX_MAX_DECODES];
+static int last_drawn_count = 0;
 static int last_page = -1;
 static std::string g_visible_rows[RX_LINES];
 
@@ -207,20 +211,63 @@ void ui_draw_countdown(float fraction, bool even_slot, int offset_hz) {
     ui_draw_offset_cursor_dot(offset_hz);
 }
 
+// Helper: copy a UiRxLine into a RxDecodeEntry with bounded string copies
+static void ui_copy_uirxline_to_entry(const UiRxLine& src, RxDecodeEntry* dst) {
+    strncpy(dst->text,   src.text.c_str(),   RX_TEXT_MAX  - 1); dst->text[RX_TEXT_MAX - 1] = '\0';
+    strncpy(dst->field1, src.field1.c_str(), RX_FIELD_MAX - 1); dst->field1[RX_FIELD_MAX - 1] = '\0';
+    strncpy(dst->field2, src.field2.c_str(), RX_FIELD_MAX - 1); dst->field2[RX_FIELD_MAX - 1] = '\0';
+    strncpy(dst->field3, src.field3.c_str(), RX_FIELD_MAX - 1); dst->field3[RX_FIELD_MAX - 1] = '\0';
+    dst->snr       = src.snr;
+    dst->offset_hz = src.offset_hz;
+    dst->slot_id   = src.slot_id;
+    dst->time_s    = 0.0f;
+    dst->is_cq     = src.is_cq;
+    dst->is_to_me  = src.is_to_me;
+}
+
 void ui_set_rx_list(const std::vector<UiRxLine>& lines) {
-    rx_lines = lines;
-    rx_page = 0;       // reset to first page
-    rx_selected = -1;  // clear selection
-    last_drawn_cache.clear();
+    int n = (int)lines.size();
+    if (n > RX_MAX_DECODES) n = RX_MAX_DECODES;
+    for (int i = 0; i < n; ++i) ui_copy_uirxline_to_entry(lines[i], &rx_lines[i]);
+    rx_lines_count = n;
+    rx_page = 0;
+    rx_selected = -1;
+    last_drawn_count = 0;
     last_page = -1;
+}
+
+void ui_set_rx_list_static(const RxDecodeEntry* entries, int count) {
+    DispGuard guard;
+    int n = count;
+    if (n > RX_MAX_DECODES) n = RX_MAX_DECODES;
+    if (n < 0) n = 0;
+    for (int i = 0; i < n; ++i) rx_lines[i] = entries[i];  // POD copy, no heap
+    rx_lines_count = n;
+    rx_page = 0;
+    rx_selected = -1;
+    last_drawn_count = 0;
+    last_page = -1;
+}
+
+bool ui_get_rx_entry(int idx, RxDecodeEntry* out) {
+    if (!out) return false;
+    DispGuard guard;
+    if (idx < 0 || idx >= rx_lines_count) return false;
+    *out = rx_lines[idx];  // POD copy
+    return true;
+}
+
+int ui_get_rx_count() {
+    DispGuard guard;
+    return rx_lines_count;
 }
 
 void ui_force_redraw_rx() {
-    last_drawn_cache.clear();
+    last_drawn_count = 0;
     last_page = -1;
 }
 
-static void draw_rx_line(int y, const UiRxLine& l, int line_no, bool selected, bool more_indicator) {
+static void draw_rx_line(int y, const RxDecodeEntry& l, int line_no, bool selected, bool more_indicator) {
     uint16_t color = TFT_WHITE;
     if (more_indicator) {
         color = rgb565(0, 255, 255); // cyan to indicate more pages
@@ -236,10 +283,12 @@ static void draw_rx_line(int y, const UiRxLine& l, int line_no, bool selected, b
     M5.Display.setCursor(0, y);
     M5.Display.printf("%d ", line_no);
     M5.Display.setTextColor(color, bg);
-    M5.Display.printf("%s", l.text.c_str());
+    M5.Display.printf("%s", l.text);
     int row_idx = line_no - 1;
     if (row_idx >= 0 && row_idx < RX_LINES) {
-        g_visible_rows[row_idx] = std::to_string(line_no) + " " + l.text;
+        char buf[RX_TEXT_MAX + 8];
+        snprintf(buf, sizeof(buf), "%d %s", line_no, l.text);
+        g_visible_rows[row_idx] = buf;
     }
 }
 
@@ -248,11 +297,11 @@ void ui_draw_rx(int flash_index) {
     // Add a 3px gap below the countdown before the first line
     const int start_y = WATERFALL_H + COUNTDOWN_H + 3;
     // Only redraw when page changes or content changes, but always draw if list is empty
-    if (!(rx_lines.empty()) && flash_index < 0) {
-        if (rx_page == last_page && last_drawn_cache.size() == rx_lines.size()) {
+    if (rx_lines_count > 0 && flash_index < 0) {
+        if (rx_page == last_page && last_drawn_count == rx_lines_count) {
             bool same = true;
-            for (size_t i = 0; i < rx_lines.size(); ++i) {
-                if (rx_lines[i].text != last_drawn_cache[i].text ||
+            for (int i = 0; i < rx_lines_count; ++i) {
+                if (strcmp(rx_lines[i].text, last_drawn_cache[i].text) != 0 ||
                     rx_lines[i].is_cq != last_drawn_cache[i].is_cq ||
                     rx_lines[i].is_to_me != last_drawn_cache[i].is_to_me) {
                     same = false;
@@ -271,9 +320,9 @@ void ui_draw_rx(int flash_index) {
         int idx = start + i;
         int y = start_y + i * line_h;
         M5.Display.fillRect(0, y, SCREEN_W, line_h, TFT_BLACK);
-        if (idx < (int)rx_lines.size()) {
+        if (idx < rx_lines_count) {
             bool selected = (idx == flash_index);
-            bool more = (rx_page == 0 && rx_lines.size() > RX_LINES && i == RX_LINES - 1);
+            bool more = (rx_page == 0 && rx_lines_count > RX_LINES && i == RX_LINES - 1);
             draw_rx_line(y, rx_lines[idx], i + 1, selected, more);
         } else {
             g_visible_rows[i].clear();
@@ -284,15 +333,17 @@ void ui_draw_rx(int flash_index) {
     // cache drawn content
     if (flash_index < 0) {
         last_page = rx_page;
-        last_drawn_cache.resize(rx_lines.size());
-        for (size_t i = 0; i < rx_lines.size(); ++i) {
-            last_drawn_cache[i].text = rx_lines[i].text;
+        last_drawn_count = rx_lines_count;
+        for (int i = 0; i < rx_lines_count; ++i) {
+            strncpy(last_drawn_cache[i].text, rx_lines[i].text, RX_TEXT_MAX - 1);
+            last_drawn_cache[i].text[RX_TEXT_MAX - 1] = '\0';
             last_drawn_cache[i].is_cq = rx_lines[i].is_cq;
             last_drawn_cache[i].is_to_me = rx_lines[i].is_to_me;
+            last_drawn_cache[i].valid = true;
         }
     } else {
         last_page = -1;
-        last_drawn_cache.clear();
+        last_drawn_count = 0;
     }
 }
 
@@ -306,14 +357,14 @@ int ui_handle_rx_key(char c) {
             ui_draw_rx();
         }
     } else if (c == '.') {
-        if ((rx_page + 1) * RX_LINES < (int)rx_lines.size()) {
+        if ((rx_page + 1) * RX_LINES < rx_lines_count) {
             rx_page++;
             ui_draw_rx();
         }
     } else if (c >= '1' && c <= '6') {
         int line = c - '1';
         int idx = rx_page * RX_LINES + line;
-        if (idx >= 0 && idx < (int)rx_lines.size()) {
+        if (idx >= 0 && idx < rx_lines_count) {
             rx_selected = idx;
             ui_draw_rx();
             selected_idx = idx;
@@ -382,7 +433,7 @@ void ui_set_visible_text_line(int row_idx, const std::string& text) {
 }
 
 void ui_get_rx_page_info(int& current_page, int& total_pages) {
-    total_pages = (int)rx_lines.size() <= 0 ? 1 : (((int)rx_lines.size() + RX_LINES - 1) / RX_LINES);
+    total_pages = (rx_lines_count <= 0) ? 1 : ((rx_lines_count + RX_LINES - 1) / RX_LINES);
     if (total_pages < 1) total_pages = 1;
     current_page = rx_page + 1;
     if (current_page < 1) current_page = 1;

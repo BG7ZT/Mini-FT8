@@ -47,6 +47,7 @@ bool load_test_data(const std::string& filename, TestData& out) {
         out.config.tx_on_even  = c.value("TX_ON_EVEN", false);
         out.config.cq_type    = c.value("CQ_TYPE", "");
         out.config.free_text  = c.value("FREE_TEXT", "");
+        out.config.max_retry  = c.value("MAX_RETRY", 5);
     }
 
     // --- periods ---

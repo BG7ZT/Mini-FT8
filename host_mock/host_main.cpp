@@ -66,6 +66,7 @@ int main(int argc, char* argv[]) {
     autoseq_set_station(td.config.my_callsign, td.config.my_grid);
     autoseq_set_adif_callback(adif_callback);
     autoseq_set_cabrillo_fd_callback(cabrillo_fd_callback);
+    autoseq_set_max_retry(td.config.max_retry);
 
     // Configure CQ type from test config
     if (!td.config.cq_type.empty()) {

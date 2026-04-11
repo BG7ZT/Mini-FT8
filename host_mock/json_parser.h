@@ -16,6 +16,7 @@ struct TestConfig {
     bool        tx_on_even = false;
     std::string cq_type;       // "CQ", "FD", "SOTA", etc.
     std::string free_text;     // FD exchange or freetext (e.g. "1A SCV")
+    int         max_retry = 5; // autoseq_set_max_retry (default 5)
 };
 
 struct BeaconChange {

@@ -626,8 +626,13 @@ static CopyLogsResult copy_logs_spiffs_to_sd_overwrite() {
   CopyLogsResult result{};
   esp_err_t mret = ensure_sdcard_mounted();
   if (mret != ESP_OK) {
+    std::vector<std::string> files;
+    int candidate_count = 0;
+    if (collect_spiffs_regular_files(files)) {
+      candidate_count = (int)files.size();
+    }
     result.err = mret;
-    result.missed_count = 1;
+    result.missed_count = std::max(1, candidate_count);
     return result;
   }
   vTaskDelay(pdMS_TO_TICKS(100));
@@ -3209,7 +3214,7 @@ static void draw_menu_view() {
   if (menu_copy_feedback_deadline > 0 && !menu_copy_feedback_text.empty()) {
     lines.push_back(menu_copy_feedback_text);
   } else {
-    lines.push_back("Copy Logs to SD");
+    lines.push_back("Copy Files to SD");
   }
   lines.push_back(menu_delete_confirm ? "Are you sure Y/N?" : "Delete All Files");
 

@@ -109,6 +109,13 @@ static std::string g_ble_last_payload;
 static int64_t g_ble_last_tick_slot = -1;
 static int g_ble_last_tick_sec = -1;
 static bool g_ble_text_mode = false;
+static volatile uint32_t g_ble_decode_event_seq = 0;
+static volatile int g_ble_decode_event_count = 0;
+static uint32_t g_ble_decode_event_seq_seen = 0;
+static void ble_publish_decode_event(int decoded_count) {
+  g_ble_decode_event_count = decoded_count;
+  g_ble_decode_event_seq = g_ble_decode_event_seq + 1;
+}
 static const char* BT_TAG = "BLE_INIT";
 
 enum class BleDumpTxMode : uint8_t {
@@ -2669,6 +2676,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     ui_set_rx_list_static(nullptr, 0);
     if (update_ui) { ui_draw_rx(); }
     else g_rx_dirty = true;
+    ble_publish_decode_event(0);
     g_decode_in_progress = false;
     return;
   }
@@ -2873,6 +2881,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
   } else {
     g_rx_dirty = true;
   }
+  ble_publish_decode_event(s_dec_count);
 
   // ---- heap instrumentation (exit) ----
   {
@@ -3617,14 +3626,6 @@ static std::string ble_timing_token(int sec, bool even_slot, bool txing) {
   return even_slot ? ":" : ".";
 }
 
-static void ble_notify_line(const std::string& raw) {
-  std::string line = raw;
-  while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
-    line.pop_back();
-  }
-  ble_notify_payload(line + "\n");
-}
-
 static void ble_start_qso_pick_mode() {
   if (g_ble_qso_pick_mode) return;
   g_ble_qso_return_mode = ui_mode;
@@ -3740,6 +3741,16 @@ static void ble_countdown_tick() {
   if (!g_ble_enabled) return;
   if (g_ble_dump_in_progress) return;
   if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
+
+  const uint32_t seq = g_ble_decode_event_seq;
+  if (seq != g_ble_decode_event_seq_seen) {
+    g_ble_decode_event_seq_seen = seq;
+    if (!g_ble_text_mode) {
+      char buf[24];
+      std::snprintf(buf, sizeof(buf), "[D:%d]", g_ble_decode_event_count);
+      ble_notify_payload(std::string(buf));
+    }
+  }
 
   int64_t slot_idx = 0;
   int sec = 0;

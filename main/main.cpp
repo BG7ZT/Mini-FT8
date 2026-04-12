@@ -691,24 +691,6 @@ static CopyLogsResult copy_logs_spiffs_to_sd_overwrite() {
   unmount_sd_spi("/sdcard");
   return result;
 }
-// Delete all regular files on SPIFFS, except Station.txt.
-static esp_err_t delete_logs_on_spiffs_keep_stationdata() {
-  DIR* d = opendir("/spiffs");
-  if (!d) return ESP_FAIL;
-
-  struct dirent* ent;
-  while ((ent = readdir(d)) != nullptr) {
-    const char* name = ent->d_name;
-    if (!name || name[0] == '.') continue;
-    if (strcmp(name, "Station.txt") == 0) continue;
-    std::string path = std::string("/spiffs/") + name;
-    struct stat st;
-    if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) continue;
-    unlink(path.c_str());  // ignore missing/err
-  }
-  closedir(d);
-  return ESP_OK;
-}
 
 #define CALLSIGN_HASHTABLE_SIZE 256
 
@@ -1100,10 +1082,15 @@ static bool rtc_valid = false;
 
 // RTC deep sleep compensation
 // rtc_sleep_epoch: epoch time when entering deep sleep (for calculating elapsed time)
-// rtc_comp is fixed for this build (seconds per 10000 seconds).
+// rtc_comp is seconds per 10000 seconds and can be adjusted via MENU O page.
 static constexpr int kRtcCompFixed = 120;
 static time_t g_rtc_sleep_epoch = 0;
 static int g_rtc_comp = kRtcCompFixed;
+static int clamp_rtc_comp_value(int value) {
+  if (value < -9000) return -9000;
+  if (value > 9000) return 9000;
+  return value;
+}
 
 enum class CqType { CQ, CQSOTA, CQPOTA, CQQRP, CQFD, CQFREETEXT };
 enum class OffsetSrc { RANDOM, CURSOR, RX };
@@ -1159,7 +1146,6 @@ static int64_t menu_flash_deadline = 0;  // ms timestamp when flash ends
 static std::string menu_copy_feedback_text;
 static int64_t menu_copy_feedback_deadline = 0;
 static constexpr int64_t kMenuCopyFeedbackMs = 1800;
-static bool menu_delete_confirm = false;  // confirmation state for Delete Logs
 static int rx_flash_idx = -1;
 static int64_t rx_flash_deadline = 0;
 static constexpr int64_t kStatusCommitDelayMs = 3000;
@@ -3207,16 +3193,20 @@ static void draw_menu_view() {
   lines.push_back(std::string("SkipTX1:") + (g_skip_tx1 ? "ON" : "OFF"));
   lines.push_back(std::string("ActiveBand:") + head_trim(g_active_band_text, 16));
   if (menu_edit_idx == 15) {
-    lines.push_back(std::string("Max Retry:") + menu_edit_buf);
+    lines.push_back(std::string("RTC Comp:") + menu_edit_buf);
   } else {
-    lines.push_back(std::string("Max Retry:") + std::to_string(g_autoseq_max_retry));
+    lines.push_back(std::string("RTC Comp:") + std::to_string(g_rtc_comp));
   }
   if (menu_copy_feedback_deadline > 0 && !menu_copy_feedback_text.empty()) {
     lines.push_back(menu_copy_feedback_text);
   } else {
     lines.push_back("Copy Files to SD");
   }
-  lines.push_back(menu_delete_confirm ? "Are you sure Y/N?" : "Delete All Files");
+  if (menu_edit_idx == 17) {
+    lines.push_back(std::string("Max Retry:") + menu_edit_buf);
+  } else {
+    lines.push_back(std::string("Max Retry:") + std::to_string(g_autoseq_max_retry));
+  }
 
   int highlight_abs = -1;
   if (menu_edit_idx >= 0) {
@@ -3567,7 +3557,8 @@ static const char* menu_edit_label(int idx) {
     case 7:  return "Cursor";
     case 9:  return "IgnoreList";
     case 10: return "Comment";
-    case 15: return "Max Retry";
+    case 15: return "RTC Comp";
+    case 17: return "Max Retry";
     default: return "Edit";
   }
 }
@@ -3591,9 +3582,7 @@ static std::string ble_menu_long_edit_label() {
 static std::string ble_text_mode_line7() {
   std::string item = "Edit";
 
-  if (menu_delete_confirm) {
-    item = "Delete All Files";
-  } else if (menu_long_edit) {
+  if (menu_long_edit) {
     item = ble_menu_long_edit_label();
   } else if (menu_edit_idx >= 0) {
     item = menu_edit_label(menu_edit_idx);
@@ -4199,7 +4188,7 @@ static void load_station_data() {
   // Sync only Station.txt from SD to SPIFFS (no legacy fallback).
   sync_station_txt_from_sd_to_spiffs();
 
-  // Load-time defaults for fixed/runtime settings.
+  // Load-time defaults for runtime settings.
   g_rtc_comp = kRtcCompFixed;
   g_autoseq_max_retry = AUTOSEQ_MAX_RETRY;
   g_ble_enabled = true;
@@ -4260,7 +4249,7 @@ static void load_station_data() {
     } else if (sscanf(line, "ble_enabled=%d", &val) == 1) {
       g_ble_enabled = (val != 0);
     } else if (sscanf(line, "rtc_comp=%d", &val) == 1) {
-      // Legacy key kept for file compatibility; ignored (fixed to kRtcCompFixed).
+      g_rtc_comp = clamp_rtc_comp_value(val);
     } else {
       long long epoch_tmp = 0;
       if (sscanf(line, "rtc_sleep_epoch=%lld", &epoch_tmp) == 1) {
@@ -4308,7 +4297,7 @@ static void save_station_data() {
   fprintf(f, "rxtx_log=%d\n", g_rxtx_log ? 1 : 0);
   fprintf(f, "active_bands=%s\n", g_active_band_text.c_str());
   fprintf(f, "rtc_sleep_epoch=%lld\n", (long long)g_rtc_sleep_epoch);
-  fprintf(f, "rtc_comp=%d\n", kRtcCompFixed);
+  fprintf(f, "rtc_comp=%d\n", g_rtc_comp);
   fprintf(f, "autoseq_max_retry=%d\n", g_autoseq_max_retry);
   fprintf(f, "ble_enabled=%d\n", g_ble_enabled ? 1 : 0);
   fclose(f);
@@ -4368,7 +4357,6 @@ static void enter_mode(UIMode new_mode) {
       menu_page = 0;
       menu_edit_idx = -1;
       menu_edit_buf.clear();
-      menu_delete_confirm = false;
       draw_menu_view();
       break;
     case UIMode::DEBUG:
@@ -4419,8 +4407,7 @@ static void ble_exit_text_mode() {
 }
 
 static bool ble_text_target_active() {
-  return menu_delete_confirm ||
-         menu_long_edit ||
+  return menu_long_edit ||
          menu_edit_idx >= 0 ||
          band_edit_idx >= 0 ||
          status_edit_idx == 4 ||
@@ -4429,23 +4416,6 @@ static bool ble_text_target_active() {
 
 static void ble_commit_text_input(const BleUiInput& input) {
   std::string value = ble_trim_trailing_crlf(input.data, input.len);
-
-  if (menu_delete_confirm) {
-    const char ans = value.empty() ? '\0' : value[0];
-    if (ans == 'Y' || ans == 'y') {
-      esp_err_t err = delete_logs_on_spiffs_keep_stationdata();
-      menu_delete_confirm = false;
-      menu_flash_idx = 17; // abs index of line 6 on page 2
-      menu_flash_deadline = rtc_now_ms() + 500;
-      debug_log_line(err == ESP_OK ? "Logs deleted" : "Delete failed");
-      draw_menu_view();
-    } else {
-      menu_delete_confirm = false;
-      draw_menu_view();
-    }
-    ble_exit_text_mode();
-    return;
-  }
 
   if (menu_long_edit) {
     if (menu_long_kind != LONG_COMMENT) {
@@ -4483,7 +4453,8 @@ static void ble_commit_text_input(const BleUiInput& input) {
       ascii_upper_inplace(value);
     }
     if (menu_edit_idx == 7 && value.size() > 10) value.resize(10);
-    if (menu_edit_idx == 15 && value.size() > 10) value.resize(10);
+    if (menu_edit_idx == 15 && value.size() > 11) value.resize(11);
+    if (menu_edit_idx == 17 && value.size() > 10) value.resize(10);
     menu_edit_buf = value;
 
     // Absolute indices across pages
@@ -4492,10 +4463,19 @@ static void ble_commit_text_input(const BleUiInput& input) {
     else if (menu_edit_idx == 7) { g_offset_hz = atoi(menu_edit_buf.c_str()); redraw_countdown_now(); }
     else if (menu_edit_idx == 10) { g_comment1 = menu_edit_buf; }
     else if (menu_edit_idx == 15) {
-      int v = atoi(menu_edit_buf.c_str());
-      if (v < 0) v = 0;
-      g_autoseq_max_retry = v;
-      autoseq_set_max_retry(g_autoseq_max_retry);
+      char* end = nullptr;
+      long v = std::strtol(menu_edit_buf.c_str(), &end, 10);
+      if (end != menu_edit_buf.c_str() && end && *end == '\0') {
+        g_rtc_comp = clamp_rtc_comp_value((int)v);
+      }
+    } else if (menu_edit_idx == 17) {
+      char* end = nullptr;
+      long v = std::strtol(menu_edit_buf.c_str(), &end, 10);
+      if (end != menu_edit_buf.c_str() && end && *end == '\0') {
+        if (v < 0) v = 0;
+        g_autoseq_max_retry = (int)v;
+        autoseq_set_max_retry(g_autoseq_max_retry);
+      }
     }
     if (menu_edit_idx == 3) {
       ble_update_name_from_station(true);
@@ -4895,7 +4875,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
       status_cursor_pos = -1;
     }
   };
-  if (!(ui_mode == UIMode::MENU && (menu_edit_idx >= 0 || menu_long_edit || menu_delete_confirm))) {
+  if (!(ui_mode == UIMode::MENU && (menu_edit_idx >= 0 || menu_long_edit))) {
       // Mode switch keys (disabled while editing in MENU)
       if (c == 'r' || c == 'R') { cancel_status_edit(); enter_mode(UIMode::RX); ui_force_redraw_rx(); ui_draw_rx(); switched = true; }
       else if (c == 't' || c == 'T') { cancel_status_edit(); enter_mode(ui_mode == UIMode::TX ? UIMode::RX : UIMode::TX); switched = true; }
@@ -5339,10 +5319,19 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 else if (menu_edit_idx == 7) { g_offset_hz = atoi(menu_edit_buf.c_str()); redraw_countdown_now(); }
                 else if (menu_edit_idx == 10) { g_comment1 = menu_edit_buf; }
                 else if (menu_edit_idx == 15) {
-                  int v = atoi(menu_edit_buf.c_str());
-                  if (v < 0) v = 0;
-                  g_autoseq_max_retry = v;
-                  autoseq_set_max_retry(g_autoseq_max_retry);
+                  char* end = nullptr;
+                  long v = std::strtol(menu_edit_buf.c_str(), &end, 10);
+                  if (end != menu_edit_buf.c_str() && end && *end == '\0') {
+                    g_rtc_comp = clamp_rtc_comp_value((int)v);
+                  }
+                } else if (menu_edit_idx == 17) {
+                  char* end = nullptr;
+                  long v = std::strtol(menu_edit_buf.c_str(), &end, 10);
+                  if (end != menu_edit_buf.c_str() && end && *end == '\0') {
+                    if (v < 0) v = 0;
+                    g_autoseq_max_retry = (int)v;
+                    autoseq_set_max_retry(g_autoseq_max_retry);
+                  }
                 }
                 if (menu_edit_idx == 3) {
                   ble_update_name_from_station(true);
@@ -5385,8 +5374,18 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 redraw_countdown_now();
               } else if (c >= 32 && c < 127) {
                 char ch = c;
-                if (menu_edit_idx == 15 && (ch < '0' || ch > '9')) {
-                  break;
+                if (menu_edit_idx == 15) {
+                  const bool is_sign = (ch == '+' || ch == '-');
+                  const bool is_digit = (ch >= '0' && ch <= '9');
+                  if (is_sign) {
+                    if (!menu_edit_buf.empty()) break;
+                  } else if (!is_digit) {
+                    break;
+                  }
+                  if (menu_edit_buf.size() >= 11) break;
+                } else if (menu_edit_idx == 17) {
+                  if (ch < '0' || ch > '9') break;
+                  if (menu_edit_buf.size() >= 10) break;
                 }
                 if (menu_edit_idx % 6 == 3 || menu_edit_idx % 6 == 4 || menu_edit_idx % 6 == 5) {
                   ch = toupper((unsigned char)ch);
@@ -5397,21 +5396,6 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                   g_offset_hz = atoi(menu_edit_buf.c_str());
                   redraw_countdown_now();
                 }
-              }
-              break;
-            }
-            if (menu_delete_confirm) {
-              // Confirmation prompt for "Delete Logs" (page 2 line 6)
-              if (c == 'Y' || c == 'y') {
-                esp_err_t err = delete_logs_on_spiffs_keep_stationdata();
-                menu_delete_confirm = false;
-                menu_flash_idx = 17; // abs index of line 6 on page 2
-                menu_flash_deadline = rtc_now_ms() + 500;
-                debug_log_line(err == ESP_OK ? "Logs deleted" : "Delete failed");
-                draw_menu_view();
-              } else if (c == 'N' || c == 'n' || c == '`') {
-                menu_delete_confirm = false;
-                draw_menu_view();
               }
               break;
             }
@@ -5550,8 +5534,8 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 if (c_from_ble) ble_enter_text_mode();
 #endif
               } else if (c == '4') {
-                menu_edit_idx = 15; // Max Retry line
-                menu_edit_buf = std::to_string(g_autoseq_max_retry);
+                menu_edit_idx = 15; // RTC Comp line
+                menu_edit_buf = std::to_string(g_rtc_comp);
                 draw_menu_view();
 #if ENABLE_BLE
                 if (c_from_ble) ble_enter_text_mode();
@@ -5582,7 +5566,8 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
 
                 draw_menu_view();
               } else if (c == '6') {
-                menu_delete_confirm = true;
+                menu_edit_idx = 17; // Max Retry line
+                menu_edit_buf = std::to_string(g_autoseq_max_retry);
                 draw_menu_view();
 #if ENABLE_BLE
                 if (c_from_ble) ble_enter_text_mode();

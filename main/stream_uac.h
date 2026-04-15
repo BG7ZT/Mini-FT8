@@ -32,6 +32,8 @@ typedef enum {
     UAC_PROFILE_GENERIC_USB = 1, // Generic USB audio + generic CDC scan
 } uac_stream_profile_t;
 
+#define UAC_WATERFALL_ROW_WIDTH 240
+
 // Get current UAC streaming state
 uac_stream_state_t uac_get_state(void);
 
@@ -56,6 +58,10 @@ const char* uac_get_status_string(void);
 // Returns pointer to static buffer, do not free
 const char* uac_get_debug_line1(void);
 const char* uac_get_debug_line2(void);
+
+// Copy the latest scaled waterfall row (240 bins) produced by UAC streaming.
+// Returns false when no valid row is available.
+bool uac_get_latest_waterfall_row(uint8_t* out_row, int out_len);
 
 // USB CDC-ACM (CAT control) helpers
 bool cat_cdc_ready(void);

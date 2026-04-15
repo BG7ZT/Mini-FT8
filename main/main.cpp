@@ -2657,7 +2657,12 @@ static int dec_sort_cmp(const void* a, const void* b) {
   const DecodeMsg* db = (const DecodeMsg*)b;
   int ga = da->is_to_me ? 0 : (da->is_cq ? 1 : 2);
   int gb = db->is_to_me ? 0 : (db->is_cq ? 1 : 2);
-  return ga - gb;
+  if (ga != gb) return ga - gb;
+  // CQ block only: strongest first.
+  if (ga == 1 && da->snr != db->snr) {
+    return db->snr - da->snr;
+  }
+  return 0;
 }
 
 void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool update_ui) {

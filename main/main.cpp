@@ -1138,6 +1138,7 @@ static std::string g_grid = "CM97";
 static std::string g_grid_saved_manual = "CM97";
 static bool g_grid_from_gps = false;
 static bool g_time_synced_from_gps = false;
+static std::string g_grid_gps_display8;
 bool g_decode_enabled = true;
 int g_time_osr = 2;
 int g_freq_osr = 1;
@@ -1153,6 +1154,7 @@ static RadioType canonical_radio_type(RadioType r);
 static RadioProfileBinding get_radio_profile_binding(RadioType r);
 static void apply_radio_profile_binding();
 static void gps_runtime_tick();
+static std::string expand_comment_macros(const std::string& src);
 // Single-threaded TX state machine (replaces separate tx_send_task)
 // TX runs in main loop via tx_tick(), one tone at a time
 static bool g_tx_active = false;           // TX state machine is running
@@ -1681,19 +1683,7 @@ static void log_adif_entry(const std::string& dxcall, const std::string& dxgrid,
   char freq_str[16];
   snprintf(freq_str, sizeof(freq_str), "%.3f", freq_mhz);
 
-  std::string comment_expanded = g_comment1;
-  auto repl = [](std::string& s, const std::string& from, const std::string& to) {
-    size_t pos = 0;
-    while ((pos = s.find(from, pos)) != std::string::npos) {
-      s.replace(pos, from.size(), to);
-      pos += to.size();
-    }
-  };
-  // Expand placeholders using current radio string
-  auto radio_name_local = [](RadioType r) {
-    return (r == RadioType::KH1) ? "KH1" : "QMX";
-  };
-  repl(comment_expanded, "/Radio", radio_name_local(g_radio));
+  std::string comment_expanded = expand_comment_macros(g_comment1);
   // Build rst_sent/rst_rcvd fragments — omit when -99 (no data),
   // matching DXFT8 reference behavior (ADIF.c omits when value is 0).
   char rst_sent_buf[32] = "";
@@ -2014,6 +2004,58 @@ static void apply_radio_profile_binding() {
            radio_control_backend_name(binding.radio_backend));
 }
 
+static std::string lat_lon_to_maidenhead8(double lat, double lon) {
+  if (lon < -180.0 || lon > 180.0 || lat < -90.0 || lat > 90.0) return "";
+  // Clamp exact upper edge so index math stays in range.
+  if (lon >= 180.0) lon = 179.999999;
+  if (lat >= 90.0) lat = 89.999999;
+
+  lon += 180.0;
+  lat += 90.0;
+
+  int field_lon = (int)(lon / 20.0);
+  int field_lat = (int)(lat / 10.0);
+  lon -= field_lon * 20.0;
+  lat -= field_lat * 10.0;
+
+  int square_lon = (int)(lon / 2.0);
+  int square_lat = (int)(lat / 1.0);
+  lon -= square_lon * 2.0;
+  lat -= square_lat * 1.0;
+
+  const double sub_lon_w = 2.0 / 24.0;
+  const double sub_lat_h = 1.0 / 24.0;
+  int sub_lon = (int)(lon / sub_lon_w);
+  int sub_lat = (int)(lat / sub_lat_h);
+  lon -= sub_lon * sub_lon_w;
+  lat -= sub_lat * sub_lat_h;
+
+  const double ext_lon_w = sub_lon_w / 10.0;
+  const double ext_lat_h = sub_lat_h / 10.0;
+  int ext_lon = (int)(lon / ext_lon_w);
+  int ext_lat = (int)(lat / ext_lat_h);
+
+  field_lon = std::clamp(field_lon, 0, 17);
+  field_lat = std::clamp(field_lat, 0, 17);
+  square_lon = std::clamp(square_lon, 0, 9);
+  square_lat = std::clamp(square_lat, 0, 9);
+  sub_lon = std::clamp(sub_lon, 0, 23);
+  sub_lat = std::clamp(sub_lat, 0, 23);
+  ext_lon = std::clamp(ext_lon, 0, 9);
+  ext_lat = std::clamp(ext_lat, 0, 9);
+
+  std::string out = "AA00aa00";
+  out[0] = (char)('A' + field_lon);
+  out[1] = (char)('A' + field_lat);
+  out[2] = (char)('0' + square_lon);
+  out[3] = (char)('0' + square_lat);
+  out[4] = (char)('a' + sub_lon);
+  out[5] = (char)('a' + sub_lat);
+  out[6] = (char)('0' + ext_lon);
+  out[7] = (char)('0' + ext_lat);
+  return out;
+}
+
 static void gps_runtime_tick() {
   static int64_t s_last_apply_ms = 0;
   static bool s_time_synced_once = false;
@@ -2041,12 +2083,18 @@ static void gps_runtime_tick() {
   if (!st.valid_fix) return;
 
   bool changed = false;
-  if (!st.grid_square.empty() && st.grid_square != "    " && st.grid_square != g_grid) {
-    g_grid = st.grid_square;
+  if (!st.grid_square.empty() && st.grid_square != "    ") {
+    const std::string grid8 = lat_lon_to_maidenhead8(st.latitude, st.longitude);
+    if (!grid8.empty()) {
+      g_grid_gps_display8 = grid8;
+    }
     g_grid_from_gps = true;
-    autoseq_set_station(g_call, g_grid);
-    changed = true;
-    ESP_LOGI(TAG, "GPS grid synced: %s", g_grid.c_str());
+    if (st.grid_square != g_grid) {
+      g_grid = st.grid_square;
+      autoseq_set_station(g_call, g_grid);
+      changed = true;
+      ESP_LOGI(TAG, "GPS grid synced: %s", g_grid.c_str());
+    }
   }
 
   if (!st.date_utc.empty() && !st.time_utc.empty()) {
@@ -2090,8 +2138,8 @@ static void gps_runtime_tick() {
   }
 }
 
-static std::string expand_comment1() {
-  std::string out = g_comment1;
+static std::string expand_comment_macros(const std::string& src) {
+  std::string out = src;
   auto repl = [](std::string& s, const std::string& from, const std::string& to) {
     size_t pos = 0;
     while ((pos = s.find(from, pos)) != std::string::npos) {
@@ -2100,7 +2148,17 @@ static std::string expand_comment1() {
     }
   };
   repl(out, "/Radio", radio_name(g_radio));
+
+  const std::string grid_macro =
+      (g_time_synced_from_gps && g_grid_from_gps && g_grid_gps_display8.size() == 8)
+          ? g_grid_gps_display8
+          : g_grid;
+  repl(out, "/Grid", grid_macro);
   return out;
+}
+
+static std::string expand_comment1() {
+  return expand_comment_macros(g_comment1);
 }
 
 static void rebuild_ignore_prefixes() {
@@ -3334,7 +3392,13 @@ static void draw_menu_view() {
   lines.push_back("Send FreeText");
   lines.push_back(std::string("F:") + head_trim(g_free_text, 16));
   lines.push_back(std::string("Call:") + elide_right(menu_edit_idx == 3 ? menu_edit_buf : g_call));
-  lines.push_back(std::string("Grid:") + elide_right(menu_edit_idx == 4 ? menu_edit_buf : g_grid));
+  std::string display_grid = g_grid;
+  if (menu_edit_idx == 4) {
+    display_grid = menu_edit_buf;
+  } else if (g_time_synced_from_gps && g_grid_from_gps && g_grid_gps_display8.size() == 8) {
+    display_grid = g_grid_gps_display8;
+  }
+  lines.push_back(std::string("Grid:") + elide_right(display_grid));
   lines.push_back(menu_sleep_batt_line());
 
   lines.push_back(std::string("Offset:") + offset_name(g_offset_src));
@@ -4486,6 +4550,7 @@ static void load_station_data() {
   g_gps_baud = 115200;
   g_grid_saved_manual = g_grid;
   g_grid_from_gps = false;
+  g_grid_gps_display8.clear();
 
   FILE* f = fopen(STATION_FILE, "r");
   if (!f) {
@@ -4530,6 +4595,7 @@ static void load_station_data() {
       g_grid = trim_upper_copy(line + 5);
       g_grid_saved_manual = g_grid;
       g_grid_from_gps = false;
+      g_grid_gps_display8.clear();
     } else if (strncmp(line, "comment1=", 9) == 0) {
       g_comment1 = trim_copy(line + 9);
     } else if (strncmp(line, "ignore_prefixes=", 16) == 0) {

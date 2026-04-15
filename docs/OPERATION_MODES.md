@@ -24,10 +24,7 @@
 - `▲` `▼` page up/down (RX/TX/BAND/MENU/QSO/Fetch/Delete).
 - `◀` `▶` left/rigth (QSO-SNR/Status-Date-Time/MENU-Fixed-LongEdit)
 - `1..6` always target the currently visible row/slot for the active mode.
-
-## BLE Terminal
-- `u` `v` page up/down (RX/TX/BAND/MENU/QSO/Fetch/Delete).
-- `z` `x` left/rigth (QSO-SNR)
+- on BLE Terminal `u` `v` page up/down, `z` `x` left/rigth (QSO-SNR)
 
 ## BLE screen Layout
 
@@ -41,12 +38,12 @@
    - text edit mode: `[Edit <item>]` (edit on BLE terminal, enter to send, no escape)
 
 Notes:
-- Waterfall bins use `space`, `.`, `:`, `|` each symbol indicates signal strength for about 100Hz
+- Waterfall bins use `space`, `.`, `:`, `|` to indicate signal strength for about 100Hz
 - counter: `|(slot boundary)`, `4`, `8`, `12`, `:(even)`, `.(odd)`, `o(Tx indicator)`
 - decoded message count: `[D:n]`
 
 ## Per-Mode Controls
- - Long Edit(for freetext, comment and IgnoreList): Enter save, Backspace delete, `` ` `` cancel, `◀` `▶` move cursor
+ - Long Edit(for freetext, comment and IgnoreList): Enter save, `` ` `` Cancel, Backspace delete, `◀` `▶` Move cursor, Hold a key to repeat
  - Edit (in place): Enter save, Backspace delete, `` ` `` cancel
    
 | Mode | Item | Notes |

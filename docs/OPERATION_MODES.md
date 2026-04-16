@@ -1,4 +1,4 @@
-# Mini-FT8 Operation Menu (V1.5)
+# Mini-FT8 Operation Menu (V2.0)
 
 ## Quick Mode Map
 
@@ -32,16 +32,16 @@
 
 1. Text waterfall frame:
    ```text
-   =============================  (29 `=` chars)
-   [                           ]  (27 bins inside brackets)
-   -----------------------------  (29 `-` chars)
+   =============================  (29 `=` Frame Boundary)
+   |                           |  (27 bins inside bars)
+   ---+----+----+----+----+----+  (29 `-` with 500Hz tick mark)
    ```
 4. Line 7 meta/edit line:
    - normal: `[MODE uv]` (`u`/`v` show page-up/page-down availability; `-` means not available)
    - text edit mode: `[Edit <item>]` (edit on BLE terminal first, enter to send, no escape)
 
 Notes:
-- Waterfall bins use `space`, `.`, `:`, `|` to indicate signal strength for about 100Hz
+- Waterfall bins use `space`, `.`, `:`, `!` to indicate signal strength for about 100Hz
 - counter: `|(slot boundary)`, `4`, `8`, `12`, `: (even)`, `. (odd)`, `o (Tx indicator)`
 - decoded message count: `[D:n]`
 

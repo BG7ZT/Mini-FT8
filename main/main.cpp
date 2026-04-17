@@ -5593,10 +5593,13 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
             save_station_data();
             draw_status_view();
             debug_log_line("Band changed");
-            // Push the new band to the radio immediately (if connected)
-            // rather than waiting for STATUS exit. User expectation: the
-            // band change should be visible on QMX/KH1 right away.
-            sync_radio_to_current_band("band change");
+            // In-memory only. CAT push is deferred to:
+            //   - STATUS exit (enter_mode), or
+            //   - QMX initial-connect (consume_cdc_initial_sync reads
+            //     current g_band_sel at sync time, so band edits made
+            //     while QMX was still enumerating get picked up).
+            // Why deferred: KH1 band change engages a physical antenna
+            // relay, and we don't want to click it on every S->3 press.
           }
               else if (c == '4') {
                 g_tune = !g_tune;

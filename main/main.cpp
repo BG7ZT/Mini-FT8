@@ -1211,6 +1211,7 @@ static void draw_status_line(int idx, const std::string& text, bool highlight);
 void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool update_ui);
 static void update_countdown();
 static void consume_cdc_initial_sync();
+static bool sync_radio_to_current_band(const char* reason);
 static void menu_flash_tick();
 static void rx_flash_tick();
 #if ENABLE_BLE
@@ -2493,26 +2494,43 @@ static void rtc_tick() {
   }
 }
 
+// Push current in-memory band to the radio, ensuring it's in RX mode.
+// Called from: QMX first-connect path (consume_cdc_initial_sync), STATUS
+// exit (enter_mode), and S->3 band-change key handler. Guards:
+//   - radio_control_ready(): CAT link must be up
+//   - !g_tx_active: never interrupt an ongoing transmission
+// Returns true on success. Callers can use the return value to decide
+// whether to clear a deferred-sync flag.
+// The `reason` string is logged for debugging.
+static bool sync_radio_to_current_band(const char* reason) {
+  if (!radio_control_ready()) return false;
+  if (g_tx_active) return false;
+  int freq_hz = g_bands[g_band_sel].freq * 1000;
+  radio_control_end_tx();  // ensure RX mode (idempotent)
+  esp_err_t rc = radio_control_sync_frequency_mode(freq_hz);
+  if (rc == ESP_OK) {
+    ESP_LOGI(TAG, "CAT sync ok (%s) freq=%d", reason ? reason : "", freq_hz);
+    std::string msg = std::string("CAT sync: ") + (reason ? reason : "");
+    debug_log_line(msg);
+    return true;
+  }
+  ESP_LOGW(TAG, "CAT sync failed (%s) rc=%d", reason ? reason : "", (int)rc);
+  return false;
+}
+
 // Consume the "CDC initial sync pending" flag set by stream_uac_task after
 // a successful QMX CDC-ACM open. Runs the same sync sequence as the manual
 // STATUS->2 button (put radio in RX + push current band to VFO), so users
-// don't have to press anything after plugging in QMX. Fires at most once
-// per CDC open (cleared after successful sync). Skipped while TXing —
-// we'll retry on the next main-loop tick. For KH1 (UART-based CAT), this
-// flag is not set; the STATUS-exit auto-sync in enter_mode handles it.
+// don't have to press anything after plugging in QMX. Called from the main
+// loop every iteration (before early-exit branches). Fires at most once
+// per CDC open — cleared on successful sync, retries on later iterations
+// until CAT becomes ready and we're not TXing. For KH1 (UART CAT, no USB
+// enumeration event), this flag is never set; the STATUS-exit auto-sync
+// and S->3 handler cover KH1.
 static void consume_cdc_initial_sync() {
   if (!g_cdc_initial_sync_pending) return;
-  if (g_tx_active) return;                 // defer — don't interrupt TX
-  if (!radio_control_ready()) return;       // CAT not up yet
-
-  int freq_hz = g_bands[g_band_sel].freq * 1000;
-  radio_control_end_tx();                   // ensure RX mode (idempotent)
-  esp_err_t rc = radio_control_sync_frequency_mode(freq_hz);
-  if (rc == ESP_OK) {
-    g_cdc_initial_sync_pending = false;     // clear only on success
-    debug_log_line("CAT initial sync ok");
-  } else {
-    ESP_LOGW(TAG, "CAT initial sync failed (rc=%d); will retry", (int)rc);
+  if (sync_radio_to_current_band("initial QMX connect")) {
+    g_cdc_initial_sync_pending = false;
   }
 }
 
@@ -4760,17 +4778,11 @@ static void enter_mode(UIMode new_mode) {
 
     // Auto-sync VFO + RX mode on STATUS exit. Picks up any in-STATUS
     // changes (band advance via S->3, etc.) without needing a manual
-    // "Sync to QMX" button press. Idempotent — safe to call even if
-    // nothing changed. For QMX: redundant when the initial-sync path
-    // already fired, but the duplicate CAT commands are harmless. For
-    // KH1: this is the primary sync path (UART CAT doesn't have a
-    // discrete "first connect" event analogous to USB enumeration).
-    if (radio_control_ready() && !g_tx_active) {
-      int freq_hz = g_bands[g_band_sel].freq * 1000;
-      radio_control_end_tx();  // ensure RX mode
-      esp_err_t rc = radio_control_sync_frequency_mode(freq_hz);
-      debug_log_line(rc == ESP_OK ? "CAT sync (STATUS exit)" : "CAT sync failed");
-    }
+    // "Sync to QMX" button press. Idempotent — safe even if the same
+    // sync already fired (e.g. from S->3 in-menu push, or from the
+    // initial-connect path for QMX). For KH1 this is the primary sync
+    // path (UART CAT has no discrete "first connect" event).
+    sync_radio_to_current_band("STATUS exit");
   }
   if (new_mode != UIMode::QSO) {
     g_ble_qso_pick_mode = false;
@@ -5176,6 +5188,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
 
     rtc_tick();
     update_countdown();
+    consume_cdc_initial_sync();  // auto-sync VFO on first QMX connect (every iter)
     check_slot_boundary();  // TX trigger at slot boundary (matching reference architecture)
     tx_tick();              // Process TX state machine (single-threaded, non-blocking)
 
@@ -5291,7 +5304,8 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
 
   rtc_tick();
   update_countdown();
-  consume_cdc_initial_sync();  // auto-sync VFO on first QMX connect
+  // consume_cdc_initial_sync() already called above, before the early-exit
+  // branches; no need to repeat here.
   check_slot_boundary();  // TX trigger at slot boundary (matching reference architecture)
   tx_tick();              // Process TX state machine (single-threaded, non-blocking)
   menu_flash_tick();
@@ -5578,8 +5592,12 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
             advance_active_band(1);
             save_station_data();
             draw_status_view();
-              debug_log_line("Band changed");
-            }
+            debug_log_line("Band changed");
+            // Push the new band to the radio immediately (if connected)
+            // rather than waiting for STATUS exit. User expectation: the
+            // band change should be visible on QMX/KH1 right away.
+            sync_radio_to_current_band("band change");
+          }
               else if (c == '4') {
                 g_tune = !g_tune;
                 if (radio_control_ready()) {

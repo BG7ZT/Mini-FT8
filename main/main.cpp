@@ -1188,10 +1188,6 @@ static int64_t menu_copy_feedback_deadline = 0;
 static constexpr int64_t kMenuCopyFeedbackMs = 1800;
 static int rx_flash_idx = -1;
 static int64_t rx_flash_deadline = 0;
-static constexpr int64_t kStatusCommitDelayMs = 3000;
-static bool g_status_pending_beacon_change = false;
-static bool g_status_pending_band_change = false;
-static int64_t g_status_pending_deadline_ms = 0;
 bool g_streaming = false;
 static void draw_menu_view();
 static void draw_battery_icon(int x, int y, int w, int h, int level, bool charging);
@@ -2599,64 +2595,7 @@ static void rx_flash_tick() {
   }
 }
 
-static void arm_status_pending_commit(bool beacon_changed, bool band_changed) {
-  if (beacon_changed) g_status_pending_beacon_change = true;
-  if (band_changed) g_status_pending_band_change = true;
-  if (g_status_pending_beacon_change || g_status_pending_band_change) {
-    g_status_pending_deadline_ms = (esp_timer_get_time() / 1000) + kStatusCommitDelayMs;
-  }
-}
-
-static void apply_pending_sync(bool force = false) {
-  if (!g_status_pending_beacon_change && !g_status_pending_band_change) return;
-
-  int64_t now_ms = esp_timer_get_time() / 1000;
-  if (!force) {
-    if (ui_mode != UIMode::STATUS) return;
-    if (g_status_pending_deadline_ms <= 0 || now_ms < g_status_pending_deadline_ms) return;
-  }
-
-  bool changed = false;
-
-  if (g_status_pending_beacon_change) {
-    if (g_beacon != g_status_beacon_temp) {
-      bool was_off = (g_beacon == BeaconMode::OFF);
-      g_beacon = g_status_beacon_temp;
-      g_tx_view_dirty = true;
-      changed = true;
-
-      if (was_off && g_beacon != BeaconMode::OFF) {
-        enqueue_beacon_cq();
-        AutoseqTxEntry pending;
-        if (autoseq_fetch_pending_tx(pending)) {
-          g_qso_xmit = true;
-          g_target_slot_parity = pending.slot_id & 1;
-          g_pending_tx = pending;
-          g_pending_tx_valid = true;
-        }
-      }
-    }
-  }
-
-  if (g_status_pending_band_change) {
-    changed = true;
-    int freq_hz = g_bands[g_band_sel].freq * 1000;
-    if (radio_control_ready()) {
-      bool ok = (radio_control_sync_frequency_mode(freq_hz) == ESP_OK);
-      debug_log_line(ok ? "CAT sync sent" : "CAT sync failed");
-    } else {
-      debug_log_line("CAT not ready");
-    }
-  }
-
-  if (changed) {
-    save_station_data();
-  }
-
-  g_status_pending_beacon_change = false;
-  g_status_pending_band_change = false;
-  g_status_pending_deadline_ms = 0;
-}
+static void apply_pending_sync() {}
 
 static int band_number_from_name(const std::string& name) {
   int num = 0;
@@ -4734,8 +4673,7 @@ static void save_station_data() {
 static void enter_mode(UIMode new_mode) {
   // No special handling needed when leaving TX mode - autoseq manages queue internally
   if (ui_mode == UIMode::STATUS && new_mode != UIMode::STATUS) {
-    apply_pending_sync(true);
-    if (g_status_pending_beacon_change && g_beacon != g_status_beacon_temp) {
+    if (g_beacon != g_status_beacon_temp) {
       bool was_off = (g_beacon == BeaconMode::OFF);
       g_beacon = g_status_beacon_temp;
       save_station_data();
@@ -4758,7 +4696,6 @@ static void enter_mode(UIMode new_mode) {
     }
     status_edit_idx = -1;
     status_edit_buffer.clear();
-    status_cursor_pos = -1;
   }
   if (new_mode != UIMode::QSO) {
     g_ble_qso_pick_mode = false;
@@ -4815,9 +4752,6 @@ static void enter_mode(UIMode new_mode) {
       break;
     case UIMode::STATUS:
       g_status_beacon_temp = g_beacon;
-      g_status_pending_beacon_change = false;
-      g_status_pending_band_change = false;
-      g_status_pending_deadline_ms = 0;
       status_edit_idx = -1;
       status_cursor_pos = -1;
       draw_status_view();
@@ -5263,7 +5197,6 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
       ui_draw_waterfall_if_dirty();
       menu_flash_tick();
       rx_flash_tick();
-      apply_pending_sync(false);
       last_key = 0;
       vTaskDelay(pdMS_TO_TICKS(10));
       continue;
@@ -5276,7 +5209,6 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     }
     // NOTE: Beacon scheduling moved to decode_monitor_results()
     ui_draw_waterfall_if_dirty();
-    apply_pending_sync(false);
     vTaskDelay(pdMS_TO_TICKS(10));
     continue;
   }
@@ -5288,7 +5220,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
   tx_tick();              // Process TX state machine (single-threaded, non-blocking)
   menu_flash_tick();
   rx_flash_tick();
-  apply_pending_sync(false);
+  apply_pending_sync();
 
   // NOTE: TX scheduling now follows reference architecture:
   // 1. decode_monitor_results() sets g_qso_xmit flag after processing
@@ -5533,11 +5465,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         }
         case UIMode::STATUS: {
         if (status_edit_idx == -1) {
-          if (c == '1') {
-            g_status_beacon_temp = (BeaconMode)(((int)g_status_beacon_temp + 1) % 3);
-            arm_status_pending_commit(true, false);
-            draw_status_view();
-          }
+          if (c == '1') { g_status_beacon_temp = (BeaconMode)(((int)g_status_beacon_temp + 1) % 3); draw_status_view(); }
           else if (c == '2') {
             status_edit_idx = 1;
             draw_status_view();
@@ -5572,11 +5500,11 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
           }
           else if (c == '3') {
             advance_active_band(1);
-            arm_status_pending_commit(false, true);
+            save_station_data();
             draw_status_view();
-            debug_log_line("Band changed");
-          }
-          else if (c == '4') {
+              debug_log_line("Band changed");
+            }
+              else if (c == '4') {
                 g_tune = !g_tune;
                 if (radio_control_ready()) {
                   int freq_hz = g_bands[g_band_sel].freq * 1000;

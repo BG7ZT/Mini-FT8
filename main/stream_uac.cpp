@@ -33,6 +33,7 @@ extern int g_time_osr;
 extern int g_freq_osr;
 extern int64_t g_decode_slot_idx;
 extern volatile bool g_decode_in_progress;
+extern volatile int64_t g_decode_applied_slot_idx;
 void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool update_ui);
 int64_t rtc_now_ms();
 
@@ -702,6 +703,12 @@ static void stream_uac_task(void* arg) {
                     ESP_LOGI(TAG, "Slot boundary %lld->%lld blocks=%d wf=%d",
                              (long long)slot_idx, (long long)now_idx,
                              slot_blocks, mon.wf.num_blocks);
+                    // The slot that just ended (slot_idx) is considered "applied"
+                    // whether we decoded it or not — we're moving past it either
+                    // way, so subsequent TX slots shouldn't block waiting for it.
+                    if (slot_idx > g_decode_applied_slot_idx) {
+                        g_decode_applied_slot_idx = slot_idx;
+                    }
                     // Reset counters at the boundary
                     slot_idx = now_idx;
                     slot_start_ms = slot_idx * 15000;
@@ -716,9 +723,15 @@ static void stream_uac_task(void* arg) {
                         g_decode_slot_idx = slot_idx;
                         g_decode_in_progress = true;  // Block TX trigger until decode finishes
                         decode_monitor_results(&mon, &mon_cfg, false);
-                        // g_decode_in_progress is cleared at the end of decode_monitor_results
+                        // g_decode_in_progress and g_decode_applied_slot_idx are
+                        // both updated at the end of decode_monitor_results.
                     } else {
                         ESP_LOGI(TAG, "Decode paused; skipping");
+                        // Decode disabled — still mark as applied so TX isn't
+                        // blocked waiting for a decode that won't happen.
+                        if (slot_idx > g_decode_applied_slot_idx) {
+                            g_decode_applied_slot_idx = slot_idx;
+                        }
                     }
                     monitor_reset(&mon);
                     mon.wf.num_blocks = 0;

@@ -940,6 +940,12 @@ static int tx_page = 0;
 // ui_set_rx_list_static() and read back via ui_get_rx_entry()/ui_get_rx_count().
 static volatile bool g_tx_view_dirty = false;  // Set when autoseq state changes
 int64_t g_decode_slot_idx = -1; // set at decode trigger to tag RX lines with slot parity
+// Monotonic index of the most recent slot whose decode has been fully applied to
+// autoseq state (or whose audio was never decoded, e.g. paused/skipped). Enforces
+// the sequential invariant "TX in slot N is blocked until decode for slot N-1 is
+// applied." Written by stream_uac_task on core 1, read by check_slot_boundary on
+// core 0. Initialized to -1 so the first TX after boot isn't blocked.
+volatile int64_t g_decode_applied_slot_idx = -1;
 
 // State machine variables (matching reference project architecture)
 // TX is scheduled by setting these flags; actual TX starts at slot boundary
@@ -2531,12 +2537,18 @@ static void check_slot_boundary() {
 
   // TX trigger: check if we should start TX in this slot
   // Conditions: qso_xmit flag set, correct parity, early enough in slot, not already TXing,
-  // and decode must be complete (TX is always triggered by decode results)
+  // and decode must be complete (TX is always triggered by decode results).
+  // Additional guard (g_decode_applied_slot_idx): enforces that decode for the
+  // previous RX slot (slot_idx - 1) has been fully applied to autoseq state before
+  // we fire TX. Without this, a slot boundary that arrives before audio capture
+  // has completed (audio is 12.64s, slot is 15s — tight window) could fire TX
+  // based on a prior cycle's state. See AUTOSEQ_INACTIVE_QUEUE.md.
   if (g_qso_xmit &&
       g_target_slot_parity == slot_parity &&
       slot_ms < 4000 &&
       !g_tx_active &&
-      !g_decode_in_progress) {
+      !g_decode_in_progress &&
+      g_decode_applied_slot_idx >= slot_idx - 1) {
 
     ESP_LOGI(TAG, "TX trigger: starting TX in slot %lld (parity %d)",
              (long long)slot_idx, slot_parity);
@@ -2884,6 +2896,11 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     if (update_ui) { ui_draw_rx(); }
     else g_rx_dirty = true;
     ble_publish_decode_event(0);
+    // No candidates means we processed the slot's audio but found nothing —
+    // still counts as "applied" for the TX-trigger guard.
+    if (g_decode_slot_idx > g_decode_applied_slot_idx) {
+      g_decode_applied_slot_idx = g_decode_slot_idx;
+    }
     g_decode_in_progress = false;
     return;
   }
@@ -3102,6 +3119,12 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
              (int)heap_exit - (int)heap_entry);
   }
 
+  // Mark this slot's decode as fully applied BEFORE clearing the in-progress
+  // flag. Readers (TX trigger on core 0) must see the applied marker as soon
+  // as in_progress drops, not later.
+  if (g_decode_slot_idx > g_decode_applied_slot_idx) {
+    g_decode_applied_slot_idx = g_decode_slot_idx;
+  }
   g_decode_in_progress = false;
 }
 

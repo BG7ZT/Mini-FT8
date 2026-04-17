@@ -17,7 +17,7 @@ static constexpr gpio_num_t k_kh1_uart_rx_pin = GPIO_NUM_1;
 static constexpr int k_kh1_uart_baud = 9600;
 static bool s_uart_inited = false;
 static bool s_kh1_enabled = false;
-static bool s_power_seq_done = false;
+static bool s_power_seq_done = true;
 
 static int s_rx_freq10 = 0;
 static int s_tx_freq10 = 0;
@@ -181,6 +181,7 @@ static esp_err_t kh1_on_audio_start(void) {
     if (err != ESP_OK) return err;
     
     if (!s_power_seq_done) {
+        
         for (int i = 0; i < 25; ++i) {
             err = kh1_send_cmd("ENAD;", 200);
             if (err != ESP_OK) return err;

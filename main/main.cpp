@@ -1035,12 +1035,12 @@ static std::vector<std::string> g_ctrl_lines = {
 };
 
 static std::vector<std::string> g_startup_lines = {
-    "Mini-FT8 V1.4.3",
-    "Command: Status Rx",
-    "Tx Qso Menu(N,O)",
-    "Band Delete",
-    "BLE: Fetch U-up V-",
-    "down Z-left X-right"
+    "** Mini-FT8 V2.0 **",
+    " S/R/T: Operate",
+    " M/N/O: Menu",
+    " Q/F/D: File",
+    "      * * * *      ",
+    "  By N6HAN & AG6AQ "
 };
 
 // Runtime latch: when true, we keep showing the startup screen until any key is pressed.
@@ -4134,7 +4134,7 @@ static void ble_mirror_tick() {
   out += "\n";
   out += g_ble_waterfall_header.empty() ? ble_blank_waterfall_header() : g_ble_waterfall_header;
   out += "\n";
-  out += "---+----+----+----+----+----+";
+  out += "---.----+----.----+----.----+";
   out += "\n";
   out += screen_key;
   ble_notify_payload(out);

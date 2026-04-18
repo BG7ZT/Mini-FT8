@@ -48,7 +48,7 @@ Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure betw
 - `M` / `N` / `O`: jump to MENU page 1 / 2 / 3. Press the current page key again to return to `RX`.
 - `` ` ``: cancel TX globally in `RX`, `TX`, and `STATUS` when not editing.
 - `▲` / `▼`: page up / page down in `RX`, `TX`, `BAND`, `MENU`, `QSO`, `Fetch`, and `Delete`.
-- `◀` / `▶`: move left / right in `QSO-SNR`, `STATUS` date/time, `MENU` fixed fields, and long edit mode.
+- `◀` / `▶`: move left / right in `QSO-SNR`, `STATUS` date/time, `MENU P2` (N->2).
 - `1`..`6`: always select the currently visible row in the active mode.
 
 ### BLE Terminal

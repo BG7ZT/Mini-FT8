@@ -214,8 +214,6 @@ bool core_cmd_ignore_clear();
 
 // System
 bool core_cmd_save_config();   // persist to flash (most setters do this auto)
-bool core_cmd_reboot();
-bool core_cmd_sleep(int duration_sec);
 
 // ---------------------------------------------------------------------------
 // ADIF bulk stream

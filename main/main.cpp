@@ -22,6 +22,7 @@ extern "C" {
 #include "esp_heap_caps.h"
 #include "autoseq.h"
 #include "core_api.h"
+#include "core_api_internal.h"
 #include <M5Cardputer.h>
 #include <sstream>
 #include <iterator>
@@ -1006,7 +1007,7 @@ void save_station_data();  // visible to core_api.cpp
 // TX entry for display and scheduling (populated by autoseq)
 static AutoseqTxEntry g_pending_tx;
 static bool g_pending_tx_valid = false;
-static volatile bool g_tx_cancel_requested = false;
+volatile bool g_tx_cancel_requested = false;   // visible to core_api.cpp
 static void host_process_bytes(const uint8_t* buf, size_t len);
 static void poll_host_uart();
 static bool ble_pop_input(BleUiInput& out);
@@ -2626,7 +2627,7 @@ static void check_slot_boundary() {
              (long long)slot_idx, slot_parity);
     autoseq_tick(slot_idx, slot_parity, 0);
     g_was_txing = false;
-    g_tx_view_dirty = true;
+    core_fire_qso_changed();  // propagates to all registered consumers
   }
 
   // TX trigger: check if we should start TX in this slot
@@ -2988,7 +2989,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     ESP_LOGW(TAG, "No candidates found");
     ui_set_rx_list_static(nullptr, 0);
     if (update_ui) { ui_draw_rx(); }
-    else g_rx_dirty = true;
+    else core_fire_rx_changed();  // propagates to all registered consumers (Cardputer, future BLE)
     ble_publish_decode_event(0);
     // No candidates means we processed the slot's audio but found nothing —
     // still counts as "applied" for the TX-trigger guard.
@@ -3165,7 +3166,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
 
     if (!to_me_auto.empty()) {
       autoseq_on_decodes(to_me_auto);
-      g_tx_view_dirty = true;
+      core_fire_qso_changed();  // propagates to all registered consumers
       g_last_reply_text = to_me_auto.front().text;
     }
 
@@ -3197,7 +3198,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     snprintf(buf, sizeof(buf), "Heap %u", heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
     debug_log_line(buf);
   } else {
-    g_rx_dirty = true;
+    core_fire_rx_changed();  // propagates to all registered consumers (Cardputer, future BLE)
   }
   ble_publish_decode_event(s_dec_count);
 
@@ -3301,7 +3302,7 @@ static void encode_and_log_pending_tx() {
 static void enqueue_beacon_cq() {
   int target_parity = (g_beacon == BeaconMode::EVEN) ? 0 : 1;
   autoseq_start_cq(target_parity);
-  g_tx_view_dirty = true;
+  core_fire_qso_changed();  // propagates to all registered consumers
 }
 
 static bool autoseq_has_pending_tx() {
@@ -3449,7 +3450,7 @@ static void tx_tick() {
     g_pending_tx_valid = false;
     g_tx_cancel_requested = false;
     g_was_txing = false;  // TX was cancelled - don't call tick at slot boundary
-    g_tx_view_dirty = true;
+    core_fire_qso_changed();  // propagates to all registered consumers
     return;
   }
 
@@ -3472,7 +3473,7 @@ static void tx_tick() {
     g_tx_active = false;
     g_pending_tx_valid = false;
     g_tx_cancel_requested = false;
-    g_tx_view_dirty = true;
+    core_fire_qso_changed();  // propagates to all registered consumers
     return;
   }
 
@@ -4790,6 +4791,9 @@ void save_station_data() {
   fprintf(f, "autoseq_max_retry=%d\n", g_autoseq_max_retry);
   fprintf(f, "ble_enabled=%d\n", g_ble_enabled ? 1 : 0);
   fclose(f);
+  // Every config mutation in the Cardputer UI funnels through here, so this
+  // is the canonical place to notify core_api consumers.
+  core_fire_config_changed();
 }
 
 static void enter_mode(UIMode new_mode) {
@@ -4801,7 +4805,7 @@ static void enter_mode(UIMode new_mode) {
       save_station_data();
       // No need to clear autoseq when beacon is turned off.
       // Any CQ in queue will transmit once, then tick moves CALLING→IDLE.
-      g_tx_view_dirty = true;
+      core_fire_qso_changed();  // propagates to all registered consumers
 
       // If beacon was just enabled, enqueue CQ and set TX flag
       // TX will trigger at next slot boundary via check_slot_boundary()
@@ -5074,6 +5078,15 @@ static void app_task_core0(void* /*param*/) {
   // After this, core_api.h consumers (Cardputer UI, future BLE server) can
   // safely call core_get_*, core_cmd_*, and register callbacks.
   core_init();
+
+  // Register the Cardputer UI as a core_api consumer. The callbacks just set
+  // the existing dirty flags — the UI main loop drains them on each tick.
+  // Trivial handlers only (spec in docs/NATIVE_CLIENT_ARCHITECTURE.md).
+  core_on_rx_changed    ([]{ g_rx_dirty = true; });
+  core_on_qso_changed   ([]{ g_tx_view_dirty = true; });
+  // config changes redraw whatever view is showing them (MENU/STATUS);
+  // set both dirty flags so the next UI tick re-evaluates.
+  core_on_config_changed([]{ g_rx_dirty = true; g_tx_view_dirty = true; });
   
 // Cabrillo Field Day log callback (implemented in autoseq.cpp; declared here to avoid header churn)
 using CabrilloFdLogCallback = void (*)(const std::string& dxcall, const std::string& their_fd_exchange);
@@ -5327,10 +5340,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     if (c == '`' &&
         (ui_mode == UIMode::RX || ui_mode == UIMode::TX || ui_mode == UIMode::STATUS) &&
         status_edit_idx == -1) {
-      g_tx_cancel_requested = true;
-      if (radio_control_ready()) {
-        radio_control_end_tx();
-      }
+      core_cmd_cancel_tx();  // routes through core_api — same effect, plus BLE notify
       debug_log_line("TX cancel requested");
       last_key = c;
       vTaskDelay(pdMS_TO_TICKS(10));
@@ -5515,24 +5525,8 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     switch (ui_mode) {
       case UIMode::RX: {
         int sel = ui_handle_rx_key(c);
-        RxDecodeEntry tapped;
-        if (sel >= 0 && ui_get_rx_entry(sel, &tapped)) {
-          // Convert static entry to UiRxLine for the autoseq API.
-          // This is on user tap (not in hot path), so the temporary
-          // std::string allocations are fine.
-          UiRxLine msg;
-          msg.text      = tapped.text;
-          msg.field1    = tapped.field1;
-          msg.field2    = tapped.field2;
-          msg.field3    = tapped.field3;
-          msg.snr       = tapped.snr;
-          msg.offset_hz = tapped.offset_hz;
-          msg.slot_id   = tapped.slot_id;
-          msg.is_cq     = tapped.is_cq;
-          msg.is_to_me  = tapped.is_to_me;
-          autoseq_on_touch(msg);
-          g_tx_view_dirty = true;
-          // Set TX flags - actual TX at slot boundary
+        if (sel >= 0 && core_cmd_tap_rx(sel)) {
+          // Arm the TX state machine for the next slot boundary.
           AutoseqTxEntry pending;
           if (autoseq_fetch_pending_tx(pending)) {
             g_qso_xmit = true;
@@ -5557,7 +5551,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
           if (start_idx + 5 < qso_count) { tx_page++; redraw_tx_view(); }
         } else if (c >= '2' && c <= '6') {
           int idx = start_idx + (c - '2');
-          if (autoseq_drop_index(idx)) {
+          if (core_cmd_drop_qso(idx)) {  // routes through core_api (fires qso_changed)
             g_pending_tx_valid = false;
             redraw_tx_view();
             // Re-evaluate TX after queue change

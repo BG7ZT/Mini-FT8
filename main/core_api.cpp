@@ -20,6 +20,8 @@
 #include "freertos/semphr.h"
 #include "esp_system.h"
 
+#include "radio_control.h"   // for radio_control_{ready,end_tx}()
+
 // ---------------------------------------------------------------------------
 // Access to main.cpp's globals (un-staticized for this purpose).
 // ---------------------------------------------------------------------------
@@ -40,6 +42,7 @@ extern int               g_rtc_comp;
 extern std::string       g_date;
 extern std::string       g_time;
 extern std::vector<std::string> g_ignore_prefixes;
+extern volatile bool     g_tx_cancel_requested;
 
 // Functions from main.cpp that core_api delegates to.
 void save_station_data();
@@ -339,11 +342,13 @@ bool core_cmd_tap_rx(int rx_list_idx) {
 }
 
 bool core_cmd_cancel_tx() {
-  // The actual cancel flag lives in main.cpp; we reach it through a small
-  // shim to avoid leaking more globals. For step 2 we just notify and let
-  // the Cardputer UI's existing cancel-key path drive the real abort.
-  // TODO(step 3): expose a proper hook.
-  return false;
+  // Mirror of the Cardputer's backtick cancel key path. The tx_tick()
+  // state machine reads g_tx_cancel_requested on its next iteration and
+  // aborts the in-flight TX; radio_control_end_tx() PTTs down immediately.
+  g_tx_cancel_requested = true;
+  if (radio_control_ready()) radio_control_end_tx();
+  core_fire_qso_changed();
+  return true;
 }
 
 bool core_cmd_clear_qso_queue() {

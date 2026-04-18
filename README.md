@@ -53,6 +53,8 @@ Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure betw
 
 ### BLE Terminal
 
+ Tested: App Store: BLE Terminal HM-10 by Gopi Gadhiya
+ 
 - `E`: cancel current TX 
 - `u` / `v`: page up / page down
 - `z` / `x`: move left / right (`QSO-SNR`)

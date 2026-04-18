@@ -18,9 +18,8 @@ Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure betw
 ### Hardware
 (I have no affiliation with the vendors.)
   - Must order: https://shop.m5stack.com/products/m5stack-cardputer-adv-version-esp32-s3 or from digikey: https://www.digikey.com/en/products/detail/m5stack-technology-co-ltd/K132-ADV/27685158
-  - Optional: https://shop.m5stack.com/products/4pin-buckled-grove-cable
-(for a homebrew serial cable, or for charging when operating long time since USB-C is occupied by QMX)
   - Optional: [https://shop.m5stack.com/products/gps-bds-unit-v1-1-at6668](https://shop.m5stack.com/products/gps-bds-unit-v1-1-at6668) (for Date/Time/Grid, other GPS modules work too)
+  - For KH1 TX : https://shop.m5stack.com/products/4pin-buckled-grove-cable, for a custmized serial cable
   - For KH1 RX: [USB C Microphone Adapter](https://www.amazon.com/dp/B0FWC9ZFC4?ref=ppx_yo2ov_dt_b_fed_asin_title&th=1), Other adapters may also work, but this one is confirmed
 
 73, Wei AG6AQ
@@ -152,7 +151,7 @@ Both 9600 and 115200 baud GPS modules are supported (auto-detected).
 ```
 ## KH1 Connections
 
- - TX Only (sotamat)
+ - TX Only ([sotamat](https://sotamat.com/))
 ```text
 ┌──────────────────┐                 ┌────────────────────────────┐
 │ KH1 RS232        │                 │ Cardputer ADV              │

@@ -1,6 +1,3 @@
-set(COMPONENT_ADD_INCLUDEDIRS
-    src
-    )
 file(GLOB SRCS
      src/*.cpp
      src/lgfx/Fonts/efont/*.c
@@ -15,7 +12,7 @@ file(GLOB SRCS
      src/lgfx/v1/platforms/esp32p4/*.cpp
      src/lgfx/v1/touch/*.cpp
      )
-set(COMPONENT_SRCS ${SRCS})
+
 
 if (IDF_VERSION_MAJOR GREATER_EQUAL 5)
     set(COMPONENT_REQUIRES nvs_flash efuse driver esp_timer esp_lcd esp_mm)
@@ -31,4 +28,11 @@ endif()
 
 message(STATUS "M5GFX use components = ${COMPONENT_REQUIRES}")
 
-register_component()
+if(COMMAND idf_component_register)
+    idf_component_register(SRCS ${SRCS} INCLUDE_DIRS src REQUIRES ${COMPONENT_REQUIRES})
+else()
+    set(COMPONENT_ADD_INCLUDEDIRS src)
+    set(COMPONENT_SRCS ${SRCS})
+    register_component()
+endif()
+

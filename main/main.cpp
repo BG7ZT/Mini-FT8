@@ -325,27 +325,16 @@ static void init_bluetooth(void)
     ble_svc_gatt_init();
     ESP_LOGI(BT_TAG, "GAP/GATT init done");
 
-    ble_cmd_queue = xQueueCreate(32, sizeof(BleUiInput));
-    assert(ble_cmd_queue);
     ble_update_name_from_station(false);
 
-    rc = ble_gatts_count_cfg(gatt_svcs);
-    if (rc != 0) {
-        ESP_LOGE(BT_TAG, "ble_gatts_count_cfg failed: %d", rc);
-        return;
-    }
-    rc = ble_gatts_add_svcs(gatt_svcs);
-    if (rc != 0) {
-        ESP_LOGE(BT_TAG, "ble_gatts_add_svcs failed: %d", rc);
-        return;
-    }
-    // Register the native client service alongside the text-terminal service.
-    // ble_native handles its own count_cfg + add_svcs.
+    // Register the native client GATT service (handles its own count_cfg + add_svcs).
+    // The former text-terminal service was removed; the mobile app is the
+    // only BLE client now.
     if (!ble_native_init()) {
         ESP_LOGE(BT_TAG, "ble_native_init failed");
-        // Continue — terminal service still works.
+        return;
     }
-    ESP_LOGI(BT_TAG, "Services added");
+    ESP_LOGI(BT_TAG, "Native BLE service registered");
 
     ble_hs_cfg.sync_cb = ble_on_sync;
 
@@ -4136,6 +4125,12 @@ static bool ble_status_clock_only_delta(const std::vector<std::string>& lines,
 }
 
 static void ble_mirror_tick() {
+  // Text-terminal screen mirror is removed. The native BLE service
+  // (ble_native.cpp) now pushes state changes via its own EVENTS /
+  // RX_LIST / QSO_QUEUE / RADIO_STREAM characteristics.
+  return;
+  // Dead code below kept temporarily for reference; will be pruned
+  // once step 5 confirms no regressions. Unreachable, zero cost.
   if (!g_ble_enabled) return;
   if (g_ble_dump_in_progress) return;
   if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
@@ -4218,6 +4213,9 @@ static void ble_mirror_tick() {
 }
 
 static void ble_countdown_tick() {
+  // Terminal-mode countdown token removed; the native app derives the
+  // slot clock from its own RTC synced via set_rtc RPC.
+  return;
   if (!g_ble_enabled) return;
   if (g_ble_dump_in_progress) return;
   if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;

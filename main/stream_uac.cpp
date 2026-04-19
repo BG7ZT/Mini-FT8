@@ -539,23 +539,25 @@ static void uac_lib_task(void* arg) {
                     // Try to open companion CDC-ACM interface (CAT)
                     cdc_try_open();
 
-                    // Start the audio processing task
+                    // Start the audio processing task using a STATIC stack
+                    // (BSS) so task creation doesn't depend on finding a
+                    // contiguous 8 KB block in a fragmented heap.
                     if (s_stream_task_handle == NULL) {
+                        static StackType_t  s_stream_task_stack[STREAM_TASK_STACK_SIZE / sizeof(StackType_t)];
+                        static StaticTask_t s_stream_task_tcb;
                         size_t free_before = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
                         size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
                         ESP_LOGI(TAG, "Pre-task-create heap: free=%u largest=%u",
                                  (unsigned)free_before, (unsigned)largest);
-                        BaseType_t ok = xTaskCreatePinnedToCore(stream_uac_task, "stream_uac",
-                                                STREAM_TASK_STACK_SIZE, NULL,
-                                                UAC_STREAM_TASK_PRIORITY,
-                                                &s_stream_task_handle, 1);
-                        if (ok != pdPASS) {
-                            ESP_LOGE(TAG, "stream_uac_task create FAILED (rc=%d) — "
-                                     "not enough heap for %u-byte stack. "
-                                     "free=%u largest=%u",
-                                     (int)ok, (unsigned)STREAM_TASK_STACK_SIZE,
+                        s_stream_task_handle = xTaskCreateStaticPinnedToCore(
+                            stream_uac_task, "stream_uac",
+                            STREAM_TASK_STACK_SIZE / sizeof(StackType_t), NULL,
+                            UAC_STREAM_TASK_PRIORITY,
+                            s_stream_task_stack, &s_stream_task_tcb, 1);
+                        if (!s_stream_task_handle) {
+                            ESP_LOGE(TAG, "stream_uac_task create FAILED "
+                                     "(static) free=%u largest=%u",
                                      (unsigned)free_before, (unsigned)largest);
-                            s_stream_task_handle = NULL;
                         }
                     }
 
@@ -610,31 +612,26 @@ static void stream_uac_task(void* arg) {
     monitor_init(&mon, &mon_cfg);
     monitor_reset(&mon);
 
-    // Static stream-task buffers — sized for our current config:
-    //   UAC USB read:  4608 bytes (UAC_READ_BUFFER_SIZE)
-    //   FT8 block:     mon.block_size floats at 6kHz = 960 × 4 = 3840 bytes
-    //                  (max 1920 × 4 = 7680 if we ever revert to 12kHz)
-    //   Resample temp: 512 floats = 2048 bytes
-    // Moving these from heap to BSS eliminates the fragmentation failure
-    // where 3 separate heap allocations couldn't find contiguous blocks
-    // after BLE+USB host init.
-    static uint8_t s_usb_buffer[UAC_READ_BUFFER_SIZE];
-    static float   s_ft8_buffer[1920];   // max block_size across 6k/12k
-    static float   s_temp_dec[512];
-    uint8_t* usb_buffer = s_usb_buffer;
-    float*   ft8_buffer = s_ft8_buffer;
-    float*   temp_dec   = s_temp_dec;
-    if (mon.block_size > (int)(sizeof(s_ft8_buffer) / sizeof(float))) {
-        ESP_LOGE(TAG, "block_size %d exceeds static ft8_buffer %u",
-                 mon.block_size,
-                 (unsigned)(sizeof(s_ft8_buffer) / sizeof(float)));
+    // Allocate buffers — USB buffer needs DMA-capable memory (the USB host
+    // driver reads into it via DMA), so MALLOC_CAP_DMA not BSS.
+    uint8_t* usb_buffer = (uint8_t*)heap_caps_malloc(UAC_READ_BUFFER_SIZE,
+                                                     MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    float*   ft8_buffer = (float*)heap_caps_malloc(sizeof(float) * mon.block_size,
+                                                   MALLOC_CAP_DEFAULT);
+    float*   temp_dec   = (float*)heap_caps_malloc(sizeof(float) * 512,
+                                                   MALLOC_CAP_DEFAULT);
+    log_heap("UAC_AFTER_FFT_ALLOC");
+    if (!usb_buffer || !ft8_buffer || !temp_dec) {
+        ESP_LOGE(TAG, "Buffer allocation failed: usb=%p ft8=%p temp=%p",
+                 usb_buffer, ft8_buffer, temp_dec);
+        if (usb_buffer) free(usb_buffer);
+        if (ft8_buffer) free(ft8_buffer);
+        if (temp_dec) free(temp_dec);
         monitor_free(&mon);
         s_stream_task_handle = NULL;
         vTaskDelete(NULL);
         return;
     }
-    log_heap("UAC_AFTER_FFT_ALLOC");
-    // Buffers are static; no NULL check or free needed.
 
     const int target_blocks = 80;
     int ft8_buffer_idx = 0;  // Current position in ft8_buffer
@@ -776,7 +773,10 @@ static void stream_uac_task(void* arg) {
         }
     }
 
-    // Cleanup — stream-task buffers are static, no free needed.
+    // Cleanup
+    free(usb_buffer);
+    free(ft8_buffer);
+    free(temp_dec);
     monitor_free(&mon);
 
     g_streaming = false;

@@ -98,17 +98,17 @@ struct AdifStreamState {
 };
 static AdifStreamState s_adif;
 
-// RPC response queue — small fixed-size buffer of pending JSON strings.
-struct RpcResponse {
-  std::string json;
+// RPC request/response queue items are POD — std::string can't ride in a
+// FreeRTOS queue (xQueueSend memcpys raw bytes, bypassing the copy ctor,
+// and you get a double-free when both the sender's copy and the receiver's
+// copy destruct). Fixed-size char buffers are safe.
+static constexpr int kRpcJsonMax = 256;
+struct RpcMsg {
+  uint16_t len;
+  char     json[kRpcJsonMax];
 };
+static QueueHandle_t s_rpc_req_queue  = nullptr;
 static QueueHandle_t s_rpc_resp_queue = nullptr;
-
-// RPC request queue — populated in the BLE write callback, consumed by TX task.
-struct RpcRequest {
-  std::string json;
-};
-static QueueHandle_t s_rpc_req_queue = nullptr;
 
 // ---------------------------------------------------------------------------
 // TX task handle
@@ -120,9 +120,13 @@ static TaskHandle_t s_tx_task = nullptr;
 // Core-API consumer callbacks (set dirty flags only; no BLE calls here)
 // ---------------------------------------------------------------------------
 
-static void on_rx_changed()     { s_evt_dirty_rx     = true; }
-static void on_qso_changed()    { s_evt_dirty_qso    = true; }
-static void on_config_changed() { s_evt_dirty_config = true; }
+static inline void wake_tx_task() {
+  if (s_tx_task) xTaskNotifyGive(s_tx_task);
+}
+
+static void on_rx_changed()     { s_evt_dirty_rx     = true; wake_tx_task(); }
+static void on_qso_changed()    { s_evt_dirty_qso    = true; wake_tx_task(); }
+static void on_config_changed() { s_evt_dirty_config = true; wake_tx_task(); }
 
 static void on_waterfall_row(const WaterfallRow& row) {
   // Keep only the most recent; drop older if TX task is behind.
@@ -137,6 +141,7 @@ static void on_waterfall_row(const WaterfallRow& row) {
     memcpy(s_wf_slot.mag, row.mag, row.num_bins);
   }
   s_wf_slot.valid = true;
+  wake_tx_task();
 }
 
 // ---------------------------------------------------------------------------
@@ -327,18 +332,17 @@ static int chr_rpc_req_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt* ctxt,
   if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) return BLE_ATT_ERR_UNLIKELY;
   if (!ctxt->om || !s_rpc_req_queue) return 0;
 
-  // Flatten the mbuf chain into a single string.
+  // Flatten the mbuf chain into our POD message. Oversized requests are
+  // dropped — legitimate RPCs fit well under 256 bytes.
   uint16_t total = OS_MBUF_PKTLEN(ctxt->om);
-  std::string body;
-  body.resize(total);
-  uint16_t copied = 0;
-  if (ble_hs_mbuf_to_flat(ctxt->om, body.data(), total, &copied) != 0) return 0;
-  body.resize(copied);
+  if (total == 0 || total >= kRpcJsonMax) return 0;
 
-  RpcRequest req;
-  req.json = std::move(body);
-  xQueueSend(s_rpc_req_queue, &req, 0);
-  // Wake the TX task promptly.
+  RpcMsg msg{};
+  uint16_t copied = 0;
+  if (ble_hs_mbuf_to_flat(ctxt->om, msg.json, total, &copied) != 0) return 0;
+  msg.json[copied] = '\0';
+  msg.len = copied;
+  xQueueSend(s_rpc_req_queue, &msg, 0);
   if (s_tx_task) xTaskNotifyGive(s_tx_task);
   return 0;
 }
@@ -615,19 +619,24 @@ void handle_rpc(const std::string& body) {
   RpcResult r = cmd.empty() ? res_err("no cmd") : dispatch_rpc(cmd, args_j);
 
   // Build the response JSON by hand — small, predictable, no cJSON allocations.
-  RpcResponse resp;
-  char buf[160];
+  RpcMsg resp{};
+  int n;
   if (r.ok) {
     if (r.extra_json.empty())
-      snprintf(buf, sizeof(buf), "{\"id\":%d,\"ok\":true}", id);
+      n = snprintf(resp.json, sizeof(resp.json), "{\"id\":%d,\"ok\":true}", id);
     else
-      snprintf(buf, sizeof(buf), "{\"id\":%d,\"ok\":true%s}", id, r.extra_json.c_str());
+      n = snprintf(resp.json, sizeof(resp.json), "{\"id\":%d,\"ok\":true%s}",
+                   id, r.extra_json.c_str());
   } else {
-    snprintf(buf, sizeof(buf), "{\"id\":%d,\"ok\":false,\"err\":\"%s\"}",
-             id, r.err.c_str());
+    n = snprintf(resp.json, sizeof(resp.json), "{\"id\":%d,\"ok\":false,\"err\":\"%s\"}",
+                 id, r.err.c_str());
   }
-  resp.json = buf;
-  if (s_rpc_resp_queue) xQueueSend(s_rpc_resp_queue, &resp, 0);
+  if (n > 0) {
+    if (n >= (int)sizeof(resp.json)) n = sizeof(resp.json) - 1;
+    resp.len = (uint16_t)n;
+    if (s_rpc_resp_queue) xQueueSend(s_rpc_resp_queue, &resp, 0);
+    if (s_tx_task) xTaskNotifyGive(s_tx_task);
+  }
 
   cJSON_Delete(root);
 }
@@ -646,6 +655,7 @@ static void pump_adif() {
   std::vector<uint8_t> buf;
   if (core_adif_read(s_adif.handle, buf, chunk)) {
     if (!buf.empty()) send_indicate(s_h_adif_stream, buf.data(), buf.size());
+    wake_tx_task();  // keep streaming without waiting for the poll timeout
   } else if (!s_adif.eof_sent) {
     // Zero-length indication = EOF marker.
     send_indicate(s_h_adif_stream, nullptr, 0);
@@ -658,8 +668,10 @@ static void pump_adif() {
 
 static void tx_task_main(void*) {
   while (true) {
-    // Wait up to 20 ms for a notification, then run a pump cycle either way.
-    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
+    // Wait for a notification (event, waterfall, RPC). ADIF streaming
+    // progresses by self-notifying on each chunk. Fallback 250 ms
+    // timeout guarantees forward progress even if a notify is ever lost.
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(250));
 
     // Event pings: drain dirty flags into one notification each.
     if (s_evt_dirty_rx)     { s_evt_dirty_rx     = false; send_event_ping(BLE_NATIVE_EVT_RX); }
@@ -670,16 +682,16 @@ static void tx_task_main(void*) {
     send_waterfall_row();
 
     // RPC requests: dispatch, response gets enqueued.
-    RpcRequest req;
+    RpcMsg req;
     while (s_rpc_req_queue && xQueueReceive(s_rpc_req_queue, &req, 0) == pdTRUE) {
-      handle_rpc(req.json);
+      handle_rpc(std::string(req.json, req.len));
     }
 
     // RPC responses: drain to RPC_RESP characteristic.
     if (s_sub_rpc_resp) {
-      RpcResponse resp;
+      RpcMsg resp;
       while (s_rpc_resp_queue && xQueueReceive(s_rpc_resp_queue, &resp, 0) == pdTRUE) {
-        send_notify(s_h_rpc_resp, resp.json.data(), resp.json.size());
+        send_notify(s_h_rpc_resp, resp.json, resp.len);
       }
     }
 
@@ -695,8 +707,8 @@ static void tx_task_main(void*) {
 bool ble_native_init(void) {
   if (s_tx_task) return true;  // already initialized
 
-  s_rpc_req_queue  = xQueueCreate(8,  sizeof(RpcRequest));
-  s_rpc_resp_queue = xQueueCreate(16, sizeof(RpcResponse));
+  s_rpc_req_queue  = xQueueCreate(8,  sizeof(RpcMsg));
+  s_rpc_resp_queue = xQueueCreate(16, sizeof(RpcMsg));
   if (!s_rpc_req_queue || !s_rpc_resp_queue) {
     ESP_LOGE(TAG, "queue create failed");
     return false;
@@ -712,8 +724,11 @@ bool ble_native_init(void) {
   core_on_config_changed(on_config_changed);
   core_on_waterfall_row (on_waterfall_row);
 
+  // Priority 3 (below app_task_core0's 5) so the local UI never gets
+  // starved by BLE TX work. Pinned to core 1 so it runs alongside the
+  // audio task but doesn't contend with the main UI loop on core 0.
   BaseType_t ok = xTaskCreatePinnedToCore(tx_task_main, "ble_native", 4096,
-                                          nullptr, 5, &s_tx_task, 0);
+                                          nullptr, 3, &s_tx_task, 1);
   if (ok != pdPASS) {
     ESP_LOGE(TAG, "tx task create failed");
     return false;

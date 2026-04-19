@@ -7,6 +7,7 @@
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_err.h"
+#include "esp_attr.h"
 #include "usb/usb_host.h"
 #include "usb/uac_host.h"
 #include "usb/cdc_acm_host.h"
@@ -53,6 +54,12 @@ int64_t rtc_now_ms();
 // UAC read buffer size (bytes) - must be multiple of 288 (USB transfer size at 48kHz/24bit/stereo)
 // 288 bytes = 48 stereo samples per 1ms USB transfer, 4608 = 288 * 16
 #define UAC_READ_BUFFER_SIZE    4608
+
+// USB host DMAs into this buffer. Placed in DMA-capable BSS via DMA_ATTR so
+// task start-up doesn't depend on finding a large DMA-capable heap block —
+// previously heap_caps_malloc(MALLOC_CAP_DMA) failed under fragmentation
+// even when raw free bytes looked sufficient (alignment eats into runs).
+static DMA_ATTR uint8_t s_usb_buffer[UAC_READ_BUFFER_SIZE];
 
 typedef struct {
     uint32_t sample_freq;
@@ -629,19 +636,17 @@ static void stream_uac_task(void* arg) {
     monitor_init(&mon, &mon_cfg);
     monitor_reset(&mon);
 
-    // Allocate buffers — USB buffer needs DMA-capable memory (the USB host
-    // driver reads into it via DMA), so MALLOC_CAP_DMA not BSS.
-    uint8_t* usb_buffer = (uint8_t*)heap_caps_malloc(UAC_READ_BUFFER_SIZE,
-                                                     MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    // USB buffer lives in DMA-capable BSS (s_usb_buffer above). Only the
+    // float working buffers are heap-allocated; they don't need DMA capability.
+    uint8_t* usb_buffer = s_usb_buffer;
     float*   ft8_buffer = (float*)heap_caps_malloc(sizeof(float) * mon.block_size,
                                                    MALLOC_CAP_DEFAULT);
     float*   temp_dec   = (float*)heap_caps_malloc(sizeof(float) * 512,
                                                    MALLOC_CAP_DEFAULT);
     log_heap("UAC_AFTER_FFT_ALLOC");
-    if (!usb_buffer || !ft8_buffer || !temp_dec) {
-        ESP_LOGE(TAG, "Buffer allocation failed: usb=%p ft8=%p temp=%p",
-                 usb_buffer, ft8_buffer, temp_dec);
-        if (usb_buffer) free(usb_buffer);
+    if (!ft8_buffer || !temp_dec) {
+        ESP_LOGE(TAG, "Buffer allocation failed: ft8=%p temp=%p",
+                 ft8_buffer, temp_dec);
         if (ft8_buffer) free(ft8_buffer);
         if (temp_dec) free(temp_dec);
         monitor_free(&mon);
@@ -790,8 +795,7 @@ static void stream_uac_task(void* arg) {
         }
     }
 
-    // Cleanup
-    free(usb_buffer);
+    // Cleanup — usb_buffer is static BSS, no free.
     free(ft8_buffer);
     free(temp_dec);
     monitor_free(&mon);

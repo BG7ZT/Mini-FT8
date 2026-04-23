@@ -141,7 +141,7 @@ Notes:
 
 ## GPS Connections
 
-Both 9600 and 115200 baud GPS modules are supported (auto-detected).
+Both 9600 and 115200 baud GPS modules are supported (auto-detected). Once Mini-FT8 gets its time/grid, the GPS can be removed, this is important for KH1.
 ```text
 ┌──────────────────┐                 ┌─────────────────────────────┐
 │ GPS              │                 │ Cardputer ADV               │

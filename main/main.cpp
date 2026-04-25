@@ -1225,7 +1225,9 @@ static void draw_status_line(int idx, const std::string& text, bool highlight);
 void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool update_ui);
 static void update_countdown();
 static void consume_cdc_initial_sync();
-static bool sync_radio_to_current_band(const char* reason);
+// Non-static so core_api.cpp's BLE set_band RPC can push the CAT change
+// immediately, matching what the Cardputer's STATUS-exit path does.
+bool sync_radio_to_current_band(const char* reason);
 static void menu_flash_tick();
 static void rx_flash_tick();
 #if ENABLE_BLE
@@ -2565,7 +2567,7 @@ static void rtc_tick() {
 // Returns true on success. Callers can use the return value to decide
 // whether to clear a deferred-sync flag.
 // The `reason` string is logged for debugging.
-static bool sync_radio_to_current_band(const char* reason) {
+bool sync_radio_to_current_band(const char* reason) {
   if (!radio_control_ready()) return false;
   if (g_tx_active) return false;
   int freq_hz = g_bands[g_band_sel].freq * 1000;

@@ -409,9 +409,17 @@ bool core_cmd_queue_freetext(const std::string& text) {
   return ok;
 }
 
+extern bool sync_radio_to_current_band(const char* reason);
+
 bool core_cmd_set_band(int band_idx) {
   if (band_idx < 0 || band_idx >= (int)g_bands.size()) return false;
-  return apply_config_write([&]{ g_band_sel = band_idx; });
+  if (!apply_config_write([&]{ g_band_sel = band_idx; })) return false;
+  // The Cardputer defers the CAT push to STATUS exit because S->3 is a
+  // tap-cycle through bands (each press would otherwise click the KH1
+  // antenna relay). The BLE client picks a band from a dropdown — one
+  // intentional change — so commit to the radio immediately.
+  sync_radio_to_current_band("BLE set_band");
+  return true;
 }
 
 bool core_cmd_set_radio(CoreRadioType r) {

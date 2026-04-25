@@ -1187,7 +1187,9 @@ void apply_radio_profile_binding();   // visible to core_api.cpp
 static void gps_runtime_tick();
 static std::string expand_comment_macros(const std::string& src);
 static std::string normalize_grid_maidenhead(const std::string& src);
-static std::string grid_ft8_4(const std::string& grid);
+// Non-static so core_api.cpp's set_call / set_grid RPCs can refresh the
+// autoseq station info exactly like the on-device MENU/STATUS edits do.
+std::string grid_ft8_4(const std::string& grid);
 // Single-threaded TX state machine (replaces separate tx_send_task)
 // TX runs in main loop via tx_tick(), one tone at a time
 static bool g_tx_active = false;           // TX state machine is running
@@ -2387,7 +2389,7 @@ static std::string normalize_grid_maidenhead(const std::string& src) {
   return out;
 }
 
-static std::string grid_ft8_4(const std::string& grid) {
+std::string grid_ft8_4(const std::string& grid) {
   const std::string norm = normalize_grid_maidenhead(grid);
   if (norm.size() >= 4) return norm.substr(0, 4);
   return "CM97";

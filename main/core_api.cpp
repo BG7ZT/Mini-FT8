@@ -435,11 +435,22 @@ bool core_cmd_set_radio(CoreRadioType r) {
   return true;
 }
 
+// Defined in main.cpp; trims/uppercases the grid to its 4-char FT8 form.
+extern std::string grid_ft8_4(const std::string& grid);
+
+// autoseq holds its own snapshot of (my_call, my_grid4) used to generate
+// CQ text and TX1/TX2/etc. Without re-pushing after a config edit, the
+// next CQ would still go out with the previous callsign — the on-device
+// MENU/STATUS edit handlers in main.cpp already do this; mirror it here.
 bool core_cmd_set_call(const std::string& call) {
-  return apply_config_write([&]{ g_call = call; });
+  if (!apply_config_write([&]{ g_call = call; })) return false;
+  autoseq_set_station(g_call, grid_ft8_4(g_grid));
+  return true;
 }
 bool core_cmd_set_grid(const std::string& grid) {
-  return apply_config_write([&]{ g_grid = grid; });
+  if (!apply_config_write([&]{ g_grid = grid; })) return false;
+  autoseq_set_station(g_call, grid_ft8_4(g_grid));
+  return true;
 }
 bool core_cmd_set_comment(const std::string& comment) {
   return apply_config_write([&]{ g_comment1 = comment; });

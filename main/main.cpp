@@ -5165,12 +5165,16 @@ static void begin_usb_host_mode() {
       ui_clear_waterfall();
       esp_err_t rc = radio_control_on_audio_start();
       debug_log_line(rc == ESP_OK ? "UAC2 catok" : "UAC2 catng");
-      // Headless-friendly fallback: arm a 10 s "no-QMX" timer. If neither
-      // the UAC mic nor the CDC-ACM endpoint enumerates by then, the main
-      // loop calls audio_source_stop and drops into CONTROL mode so the
-      // PC sees the USB Serial JTAG terminal.
-      g_qmx_detect_deadline_ms = esp_timer_get_time() / 1000 + kQmxDetectTimeoutMs;
-      g_qmx_detect_active = true;
+      // Headless-friendly fallback: arm a 10 s "no-QMX" timer when the
+      // selected radio is QMX. If neither the UAC mic nor the CDC-ACM
+      // endpoint enumerates by then, the main loop calls audio_source_stop
+      // and drops into CONTROL so the PC sees the USB Serial JTAG terminal.
+      // Gated on QMX so a future "KH1 via Cardputer I2S mic" backend (which
+      // never enumerates a USB device) doesn't trip the fallback.
+      if (canonical_radio_type(g_radio) == RadioType::QMX) {
+        g_qmx_detect_deadline_ms = esp_timer_get_time() / 1000 + kQmxDetectTimeoutMs;
+        g_qmx_detect_active = true;
+      }
     }
   }
   int freq_hz = g_bands[g_band_sel].freq * 1000;

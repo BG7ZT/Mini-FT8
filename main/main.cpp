@@ -5111,6 +5111,30 @@ static void ble_commit_text_input(const BleUiInput& input) {
 }
 #endif
 
+// "No QMX in N seconds → fall back to USB Serial JTAG / CONTROL mode" timer.
+// Set when begin_usb_host_mode arms it; cleared once we either see a QMX
+// enumerate (mic or CDC handle) or after we've fallen back. Used by the
+// main loop's periodic check below.
+static bool    g_qmx_detect_active     = false;
+static int64_t g_qmx_detect_deadline_ms = 0;
+static constexpr int64_t kQmxDetectTimeoutMs = 10000;
+
+// Tear down the USB host stack and switch to CONTROL mode. usb_host_uninstall
+// (driven by audio_source_stop's synchronous teardown chain) releases the
+// USB-OTG bus, at which point the always-installed USB Serial JTAG driver
+// resumes ownership and the PC re-enumerates Mini-FT8 as a serial device.
+static void fall_back_to_control_mode(const char* reason) {
+  g_qmx_detect_active = false;
+  ESP_LOGI(TAG, "USB host fallback: %s — entering CONTROL", reason);
+  debug_log_line("No QMX -> CONTROL");
+  audio_source_stop();
+  // Small settle window so USB Serial JTAG fully reclaims the bus before
+  // host_handle_line starts pumping bytes through it.
+  vTaskDelay(pdMS_TO_TICKS(200));
+  enter_mode(UIMode::CONTROL);
+  ui_force_redraw_rx();
+}
+
 // Perform the STATUS -> '2' action: start the UAC audio source that feeds
 // the QMX (or KH1) into the decoder, and sync CAT to the currently selected
 // band. Shared between the on-device keypress path and the 1 s splash
@@ -5141,6 +5165,12 @@ static void begin_usb_host_mode() {
       ui_clear_waterfall();
       esp_err_t rc = radio_control_on_audio_start();
       debug_log_line(rc == ESP_OK ? "UAC2 catok" : "UAC2 catng");
+      // Headless-friendly fallback: arm a 10 s "no-QMX" timer. If neither
+      // the UAC mic nor the CDC-ACM endpoint enumerates by then, the main
+      // loop calls audio_source_stop and drops into CONTROL mode so the
+      // PC sees the USB Serial JTAG terminal.
+      g_qmx_detect_deadline_ms = esp_timer_get_time() / 1000 + kQmxDetectTimeoutMs;
+      g_qmx_detect_active = true;
     }
   }
   int freq_hz = g_bands[g_band_sel].freq * 1000;
@@ -5387,6 +5417,19 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     consume_cdc_initial_sync();  // auto-sync VFO on first QMX connect (every iter)
     check_slot_boundary();  // TX trigger at slot boundary (matching reference architecture)
     tx_tick();              // Process TX state machine (single-threaded, non-blocking)
+
+    // No-QMX fallback: if begin_usb_host_mode armed the timer and nothing
+    // has enumerated by the deadline, tear USB host down and switch to
+    // CONTROL so a button-less StampS3Bat can still expose the USB serial
+    // terminal to the host PC. Detection clears the timer immediately.
+    if (g_qmx_detect_active) {
+      if (audio_source_qmx_detected()) {
+        g_qmx_detect_active = false;
+        ESP_LOGI(TAG, "QMX detected; staying in USB host mode");
+      } else if (esp_timer_get_time() / 1000 >= g_qmx_detect_deadline_ms) {
+        fall_back_to_control_mode("no QMX after 10s");
+      }
+    }
 
   // CONTROL mode: legacy host serial protocol over USB only
   if (ui_mode == UIMode::CONTROL) {

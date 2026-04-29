@@ -215,29 +215,28 @@ void core_get_rx_list(std::vector<RxDecodeEntry>& out) {
 extern AutoseqTxEntry g_pending_tx;
 extern bool           g_pending_tx_valid;
 
-void core_get_qso(QsoSnapshot& out) {
-  out.active.clear();
-  out.next_tx = NextTxEntry{};
+int core_qso_active_count() {
+  return autoseq_active_count();
+}
 
-  std::vector<QsoContext> ctxs;
-  autoseq_get_active_contexts(ctxs);
-  out.active.reserve(ctxs.size());
-  for (const auto& c : ctxs) {
-    QsoEntry e;
-    e.dxcall        = c.dxcall;
-    e.dxgrid        = c.dxgrid;
-    e.state         = map_out(c.state);
-    e.next_tx       = map_out(c.next_tx);
-    e.retry_counter = c.retry_counter;
-    e.retry_limit   = c.retry_limit;
-    e.slot_parity   = c.slot_id & 1;
-    e.snr_tx        = c.snr_tx;
-    e.snr_rx        = c.snr_rx;
-    e.is_fd         = c.is_fd;
-    e.logged        = c.logged;
-    out.active.push_back(std::move(e));
-  }
+bool core_qso_get_active(int idx, QsoEntry& out) {
+  QsoContext c;
+  if (!autoseq_get_active_context(idx, &c)) return false;
+  out.dxcall        = c.dxcall;
+  out.dxgrid        = c.dxgrid;
+  out.state         = map_out(c.state);
+  out.next_tx       = map_out(c.next_tx);
+  out.retry_counter = c.retry_counter;
+  out.retry_limit   = c.retry_limit;
+  out.slot_parity   = c.slot_id & 1;
+  out.snr_tx        = c.snr_tx;
+  out.snr_rx        = c.snr_rx;
+  out.is_fd         = c.is_fd;
+  out.logged        = c.logged;
+  return true;
+}
 
+bool core_qso_get_next_tx(NextTxEntry& out) {
   // Prefer g_pending_tx when arm_pending_tx has fired — it carries the
   // resolved offset (matching the actual TX, including the random roll
   // for RANDOM mode and beacon CQ). autoseq's own pending entry only
@@ -245,25 +244,43 @@ void core_get_qso(QsoSnapshot& out) {
   // what was reaching BLE before and pinning the marker at the config
   // default.
   if (g_pending_tx_valid && !g_pending_tx.text.empty()) {
-    out.next_tx.valid             = true;
-    out.next_tx.text              = g_pending_tx.text;
-    out.next_tx.dxcall            = g_pending_tx.dxcall;
-    out.next_tx.slot_parity       = g_pending_tx.slot_id & 1;
-    out.next_tx.offset_hz         = g_pending_tx.offset_hz;
-    out.next_tx.retries_remaining = g_pending_tx.repeat_counter;
-  } else {
-    // Not yet armed — surface autoseq's intent so the client at least
-    // knows a TX is queued, even if the offset is still placeholder.
-    AutoseqTxEntry pending{};
-    if (autoseq_fetch_pending_tx(pending)) {
-      out.next_tx.valid             = true;
-      out.next_tx.text              = pending.text;
-      out.next_tx.dxcall            = pending.dxcall;
-      out.next_tx.slot_parity       = pending.slot_id & 1;
-      out.next_tx.offset_hz         = pending.offset_hz;
-      out.next_tx.retries_remaining = pending.repeat_counter;
+    out.valid             = true;
+    out.text              = g_pending_tx.text;
+    out.dxcall            = g_pending_tx.dxcall;
+    out.slot_parity       = g_pending_tx.slot_id & 1;
+    out.offset_hz         = g_pending_tx.offset_hz;
+    out.retries_remaining = g_pending_tx.repeat_counter;
+    return true;
+  }
+  // Not yet armed — surface autoseq's intent so the client at least
+  // knows a TX is queued, even if the offset is still placeholder.
+  AutoseqTxEntry pending{};
+  if (autoseq_fetch_pending_tx(pending)) {
+    out.valid             = true;
+    out.text              = pending.text;
+    out.dxcall            = pending.dxcall;
+    out.slot_parity       = pending.slot_id & 1;
+    out.offset_hz         = pending.offset_hz;
+    out.retries_remaining = pending.repeat_counter;
+    return true;
+  }
+  out.valid = false;
+  return false;
+}
+
+void core_get_qso(QsoSnapshot& out) {
+  out.active.clear();
+  out.next_tx = NextTxEntry{};
+
+  const int n = core_qso_active_count();
+  out.active.reserve(n);
+  for (int i = 0; i < n; ++i) {
+    QsoEntry e;
+    if (core_qso_get_active(i, e)) {
+      out.active.push_back(std::move(e));
     }
   }
+  core_qso_get_next_tx(out.next_tx);
 }
 
 void core_get_config(StationConfig& out) {

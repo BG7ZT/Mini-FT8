@@ -146,6 +146,16 @@ void core_get_rx_list(std::vector<RxDecodeEntry>& out);
 // Autoseq state (active QSOs + pending TX).
 void core_get_qso(QsoSnapshot& out);
 
+// Non-allocating QSO accessors. Consumers that can't tolerate the
+// std::vector<QsoEntry>::reserve inside core_get_qso (e.g. the BLE
+// QSO_QUEUE read handler running under heap fragmentation) iterate
+// active entries via core_qso_active_count + core_qso_get_active. The
+// strings inside QsoEntry / NextTxEntry are FT8 callsigns and grids
+// short enough to live in std::string's SSO buffer — no heap there.
+int  core_qso_active_count();
+bool core_qso_get_active(int idx, QsoEntry& out);
+bool core_qso_get_next_tx(NextTxEntry& out);
+
 // Full station config.
 void core_get_config(StationConfig& out);
 

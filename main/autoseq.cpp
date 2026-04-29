@@ -494,6 +494,16 @@ void autoseq_get_active_contexts(std::vector<QsoContext>& out) {
     }
 }
 
+int autoseq_active_count() {
+    return s_active_count;
+}
+
+bool autoseq_get_active_context(int idx, QsoContext* out) {
+    if (!out || idx < 0 || idx >= s_active_count) return false;
+    *out = s_queue[idx];
+    return true;
+}
+
 void autoseq_set_adif_callback(AdifLogCallback cb) {
     s_adif_callback = cb;
 }

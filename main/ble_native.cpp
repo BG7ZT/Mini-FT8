@@ -176,70 +176,47 @@ static void on_waterfall_row(const WaterfallRow& row) {
 // + std::string + std::vector path used to abort.
 constexpr uint8_t kRxListWireVersion = 1;
 
-static const char* qso_state_name(CoreQsoState s) {
-  switch (s) {
-    case CoreQsoState::CALLING:      return "CALLING";
-    case CoreQsoState::REPLYING:     return "REPLYING";
-    case CoreQsoState::REPORT:       return "REPORT";
-    case CoreQsoState::ROGER_REPORT: return "ROGER_REPORT";
-    case CoreQsoState::ROGERS:       return "ROGERS";
-    case CoreQsoState::SIGNOFF:      return "SIGNOFF";
-    case CoreQsoState::IDLE:         return "IDLE";
-  }
-  return "?";
-}
-static const char* tx_name(CoreTxMsg t) {
-  switch (t) {
-    case CoreTxMsg::NONE: return "NONE";
-    case CoreTxMsg::TX1:  return "TX1";
-    case CoreTxMsg::TX2:  return "TX2";
-    case CoreTxMsg::TX3:  return "TX3";
-    case CoreTxMsg::TX4:  return "TX4";
-    case CoreTxMsg::TX5:  return "TX5";
-    case CoreTxMsg::TX6:  return "TX6";
-    case CoreTxMsg::FREETEXT: return "FREETEXT";
-  }
-  return "?";
-}
+// QSO_QUEUE wire format (binary, replaces the old JSON encoding):
+//
+//   u8  version       = 1
+//   u8  active_count
+//   u8  next_tx_valid
+//   [next_tx — present only when next_tx_valid != 0]
+//     u16 offset_hz   (LE)
+//     u8  slot_id     (0=even, 1=odd)
+//     u8  retries_remaining
+//     u8  call_len
+//     char call[call_len]
+//     u8  text_len
+//     char text[text_len]
+//   [active entries — active_count of them]
+//     u8  state         (CoreQsoState as u8: 0=CALLING ... 6=IDLE)
+//     u8  next_tx       (CoreTxMsg     as u8: 0=NONE 1..6=TX1..TX6 7=FREETEXT)
+//     i8  snr_tx        (-99..99; 0x80 reserved for "unset" if ever needed)
+//     i8  snr_rx
+//     u8  retry
+//     u8  retry_max
+//     u8  slot_id
+//     u8  flags         bit0 = is_fd, bit1 = logged
+//     u8  call_len
+//     char call[call_len]
+//     u8  grid_len
+//     char grid[grid_len]
+//
+// Same zero-copy story as RX_LIST: the rows are streamed directly into
+// the NimBLE mbuf, no std::vector / cJSON / std::string in the path.
+constexpr uint8_t kQsoQueueWireVersion = 1;
 
-static std::string json_build_qso_queue() {
-  QsoSnapshot snap;
-  core_get_qso(snap);
-  cJSON* root   = cJSON_CreateObject();
-  cJSON* active = cJSON_CreateArray();
-  for (const auto& q : snap.active) {
-    cJSON* o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "call",    q.dxcall.c_str());
-    cJSON_AddStringToObject(o, "grid",    q.dxgrid.c_str());
-    cJSON_AddStringToObject(o, "state",   qso_state_name(q.state));
-    cJSON_AddStringToObject(o, "nextTx",  tx_name(q.next_tx));
-    cJSON_AddNumberToObject(o, "retry",   q.retry_counter);
-    cJSON_AddNumberToObject(o, "retryMax",q.retry_limit);
-    cJSON_AddNumberToObject(o, "slot",    q.slot_parity);
-    cJSON_AddNumberToObject(o, "snrTx",   q.snr_tx);
-    cJSON_AddNumberToObject(o, "snrRx",   q.snr_rx);
-    cJSON_AddBoolToObject  (o, "fd",      q.is_fd);
-    cJSON_AddBoolToObject  (o, "logged",  q.logged);
-    cJSON_AddItemToArray(active, o);
+// Helper for the BLE callback to serialise a length-prefixed string into
+// the mbuf. Returns 0 on success, BLE_ATT_ERR_INSUFFICIENT_RES on append
+// failure (the mbuf pool — separate from main heap — is exhausted).
+static int append_lp_string(struct os_mbuf* om, const std::string& s) {
+  uint8_t len = (s.size() > 255) ? 255 : (uint8_t)s.size();
+  if (os_mbuf_append(om, &len, 1) != 0) return BLE_ATT_ERR_INSUFFICIENT_RES;
+  if (len > 0 && os_mbuf_append(om, s.data(), len) != 0) {
+    return BLE_ATT_ERR_INSUFFICIENT_RES;
   }
-  cJSON_AddItemToObject(root, "active", active);
-
-  cJSON* nx = cJSON_CreateObject();
-  cJSON_AddBoolToObject  (nx, "valid",    snap.next_tx.valid);
-  if (snap.next_tx.valid) {
-    cJSON_AddStringToObject(nx, "text",   snap.next_tx.text.c_str());
-    cJSON_AddStringToObject(nx, "call",   snap.next_tx.dxcall.c_str());
-    cJSON_AddNumberToObject(nx, "slot",   snap.next_tx.slot_parity);
-    cJSON_AddNumberToObject(nx, "offset", snap.next_tx.offset_hz);
-    cJSON_AddNumberToObject(nx, "retries",snap.next_tx.retries_remaining);
-  }
-  cJSON_AddItemToObject(root, "nextTx", nx);
-
-  char* s = cJSON_PrintUnformatted(root);
-  std::string out = s ? s : "{}";
-  if (s) free(s);
-  cJSON_Delete(root);
-  return out;
+  return 0;
 }
 
 static const char* beacon_name(CoreBeaconMode m) {
@@ -362,7 +339,90 @@ static int chr_rx_list_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt* ctxt,
 }
 static int chr_qso_queue_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt* ctxt, void*) {
   if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_UNLIKELY;
-  return access_read_str(ctxt, json_build_qso_queue());
+
+  const int total = core_qso_active_count();
+  uint8_t active_count = (total < 0) ? 0 : (total > 255 ? 255 : (uint8_t)total);
+
+  NextTxEntry nx{};
+  core_qso_get_next_tx(nx);
+
+  // Header: version + active_count + next_tx_valid.
+  uint8_t hdr[3] = {
+    kQsoQueueWireVersion,
+    active_count,
+    (uint8_t)(nx.valid ? 1 : 0),
+  };
+  if (os_mbuf_append(ctxt->om, hdr, sizeof(hdr)) != 0) {
+    return BLE_ATT_ERR_INSUFFICIENT_RES;
+  }
+
+  // next_tx body (when valid): offset, slot, retries, call, text.
+  if (nx.valid) {
+    struct __attribute__((packed)) {
+      uint16_t offset_hz;
+      uint8_t  slot_id;
+      uint8_t  retries_remaining;
+    } nx_hdr{
+      .offset_hz         = (uint16_t)(nx.offset_hz < 0 ? 0 : nx.offset_hz),
+      .slot_id           = (uint8_t)nx.slot_parity,
+      .retries_remaining = (uint8_t)(nx.retries_remaining < 0 ? 0 :
+                                     nx.retries_remaining > 255 ? 255 :
+                                     nx.retries_remaining),
+    };
+    if (os_mbuf_append(ctxt->om, &nx_hdr, sizeof(nx_hdr)) != 0) {
+      return BLE_ATT_ERR_INSUFFICIENT_RES;
+    }
+    int rc = append_lp_string(ctxt->om, nx.dxcall);
+    if (rc != 0) return rc;
+    rc = append_lp_string(ctxt->om, nx.text);
+    if (rc != 0) return rc;
+  }
+
+  // Active entries.
+  for (uint8_t i = 0; i < active_count; ++i) {
+    QsoEntry q;
+    if (!core_qso_get_active(i, q)) continue;
+
+    auto clamp_i8 = [](int v) -> int8_t {
+      if (v < -128) return -128;
+      if (v >  127) return  127;
+      return (int8_t)v;
+    };
+    auto clamp_u8 = [](int v) -> uint8_t {
+      if (v < 0) return 0;
+      if (v > 255) return 255;
+      return (uint8_t)v;
+    };
+
+    struct __attribute__((packed)) {
+      uint8_t state;
+      uint8_t next_tx;
+      int8_t  snr_tx;
+      int8_t  snr_rx;
+      uint8_t retry;
+      uint8_t retry_max;
+      uint8_t slot_id;
+      uint8_t flags;
+    } row{
+      .state     = static_cast<uint8_t>(q.state),
+      .next_tx   = static_cast<uint8_t>(q.next_tx),
+      .snr_tx    = clamp_i8(q.snr_tx),
+      .snr_rx    = clamp_i8(q.snr_rx),
+      .retry     = clamp_u8(q.retry_counter),
+      .retry_max = clamp_u8(q.retry_limit),
+      .slot_id   = (uint8_t)q.slot_parity,
+      .flags     = (uint8_t)((q.is_fd ? 0x01 : 0) | (q.logged ? 0x02 : 0)),
+    };
+
+    if (os_mbuf_append(ctxt->om, &row, sizeof(row)) != 0) {
+      return BLE_ATT_ERR_INSUFFICIENT_RES;
+    }
+    int rc = append_lp_string(ctxt->om, q.dxcall);
+    if (rc != 0) return rc;
+    rc = append_lp_string(ctxt->om, q.dxgrid);
+    if (rc != 0) return rc;
+  }
+  return 0;
 }
 static int chr_config_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt* ctxt, void*) {
   if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_UNLIKELY;

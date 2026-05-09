@@ -23,16 +23,18 @@ enum class BeaconMode { OFF = 0, EVEN, ODD };
 static BeaconMode g_beacon = BeaconMode::OFF;
 
 // ---------- ADIF callback ----------
-static void adif_callback(const std::string& dxcall, const std::string& dxgrid,
+static bool adif_callback(const std::string& dxcall, const std::string& dxgrid,
                            int rst_sent, int rst_rcvd) {
     printf(">>> ADIF log: %s %s rst_sent=%+d rst_rcvd=%+d\n",
            dxcall.c_str(), dxgrid.c_str(), rst_sent, rst_rcvd);
+    return true;
 }
 
 // ---------- Cabrillo FD callback ----------
-static void cabrillo_fd_callback(const std::string& dxcall, const std::string& their_exchange) {
+static bool cabrillo_fd_callback(const std::string& dxcall, const std::string& their_exchange) {
     printf(">>> Cabrillo FD log: %s exchange=%s\n",
            dxcall.c_str(), their_exchange.c_str());
+    return true;
 }
 
 // ---------- Helpers ----------

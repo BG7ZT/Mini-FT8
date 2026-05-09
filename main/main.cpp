@@ -20,7 +20,9 @@ extern "C" {
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "esp_heap_caps.h"
+#include "esp_freertos_hooks.h"
 #include "autoseq.h"
 #include "core_api.h"
 #include "core_api_internal.h"
@@ -496,6 +498,7 @@ struct CopyLogsResult {
   int missed_count = 0;
 };
 static esp_err_t copy_file_overwrite(const char* src_path, const char* dst_path);
+static void storage_warn_if_low_space_locked(const char* context);
 
 static void debug_log_line(const std::string& msg);
 //exported symbol (linkable from other .cpp)
@@ -574,6 +577,107 @@ static esp_err_t ensure_sdcard_mounted() {
   return ESP_FAIL;
 }
 
+static StaticSemaphore_t storage_mutex_buf;
+static SemaphoreHandle_t storage_mutex = nullptr;
+
+static bool storage_path_is_storage(const char* path) {
+  return path && std::strncmp(path, "/storage", 8) == 0 &&
+         (path[8] == '\0' || path[8] == '/');
+}
+
+static void storage_mutex_init() {
+  if (!storage_mutex) {
+    storage_mutex = xSemaphoreCreateRecursiveMutexStatic(&storage_mutex_buf);
+    ESP_ERROR_CHECK(storage_mutex ? ESP_OK : ESP_ERR_NO_MEM);
+  }
+}
+
+static bool storage_lock_take(TickType_t timeout_ticks = portMAX_DELAY) {
+  if (!storage_mutex) return false;
+  return xSemaphoreTakeRecursive(storage_mutex, timeout_ticks) == pdTRUE;
+}
+
+static void storage_lock_give() {
+  if (storage_mutex) xSemaphoreGiveRecursive(storage_mutex);
+}
+
+class StorageLockGuard {
+public:
+  explicit StorageLockGuard(TickType_t timeout_ticks = portMAX_DELAY)
+      : held_(storage_lock_take(timeout_ticks)) {}
+  StorageLockGuard(bool enabled, TickType_t timeout_ticks = portMAX_DELAY)
+      : held_(enabled ? storage_lock_take(timeout_ticks) : false) {}
+  ~StorageLockGuard() {
+    if (held_) storage_lock_give();
+  }
+  bool held() const { return held_; }
+
+private:
+  bool held_;
+};
+
+static esp_err_t storage_safe_stat(const char* path, struct stat* st) {
+  if (storage_path_is_storage(path)) {
+    StorageLockGuard guard;
+    if (!guard.held()) return ESP_FAIL;
+    return (stat(path, st) == 0) ? ESP_OK : ESP_FAIL;
+  }
+  return (stat(path, st) == 0) ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t storage_safe_unlink(const char* path) {
+  if (storage_path_is_storage(path)) {
+    StorageLockGuard guard;
+    if (!guard.held()) return ESP_FAIL;
+    return (unlink(path) == 0) ? ESP_OK : ESP_FAIL;
+  }
+  return (unlink(path) == 0) ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t storage_write_file_atomic(const char* final_path, const std::string& content) {
+  if (!storage_path_is_storage(final_path)) return ESP_FAIL;
+
+  StorageLockGuard guard;
+  if (!guard.held()) return ESP_FAIL;
+  storage_warn_if_low_space_locked(final_path);
+
+  const std::string tmp_path = (std::strcmp(final_path, STATION_FILE) == 0)
+      ? std::string("/storage/Station.tmp")
+      : std::string(final_path) + ".tmp";
+
+  FILE* f = fopen(tmp_path.c_str(), "wb");
+  if (!f) return ESP_FAIL;
+
+  esp_err_t err = ESP_OK;
+  if (!content.empty() &&
+      fwrite(content.data(), 1, content.size(), f) != content.size()) {
+    err = ESP_FAIL;
+  }
+  if (err == ESP_OK && (fflush(f) != 0 || fsync(fileno(f)) != 0)) {
+    err = ESP_FAIL;
+  }
+  if (fclose(f) != 0) {
+    err = ESP_FAIL;
+  }
+  if (err != ESP_OK) {
+    unlink(tmp_path.c_str());
+    return err;
+  }
+
+  // SPIFFS may not replace existing files reliably with rename(), so keep the
+  // old file until the synced temp file is complete, then swap under the lock.
+  if (unlink(final_path) != 0 && errno != ENOENT) {
+    unlink(tmp_path.c_str());
+    return ESP_FAIL;
+  }
+  if (rename(tmp_path.c_str(), final_path) != 0) {
+    ESP_LOGE("FT8", "Storage rename failed: %s -> %s", tmp_path.c_str(), final_path);
+    unlink(tmp_path.c_str());
+    return ESP_FAIL;
+  }
+  return ESP_OK;
+}
+
 static void build_rxtx_log_path(char* path, size_t path_sz) {
   time_t now = (time_t)(rtc_now_ms() / 1000);
   struct tm t;
@@ -588,7 +692,25 @@ static void build_rxtx_log_path(char* path, size_t path_sz) {
 
 static bool file_exists(const char* path) {
   struct stat st;
-  return (stat(path, &st) == 0) && S_ISREG(st.st_mode);
+  return (storage_safe_stat(path, &st) == ESP_OK) && S_ISREG(st.st_mode);
+}
+
+static esp_err_t copy_text_file_to_storage_atomic(const char* src_path, const char* dst_path) {
+  FILE* fs = fopen(src_path, "rb");
+  if (!fs) return ESP_FAIL;
+
+  std::string content;
+  char buf[512];
+  while (true) {
+    size_t n = fread(buf, 1, sizeof(buf), fs);
+    if (n > 0) content.append(buf, n);
+    if (n < sizeof(buf)) break;
+  }
+  bool read_ok = (ferror(fs) == 0);
+  fclose(fs);
+  if (!read_ok) return ESP_FAIL;
+
+  return storage_write_file_atomic(dst_path, content);
 }
 
 static bool g_station_txt_sync_attempted = false;
@@ -612,7 +734,7 @@ static void sync_station_txt_from_sd_to_spiffs() {
     return;
   }
 
-  if (copy_file_overwrite(sd_path, spiffs_path) == ESP_OK) {
+  if (copy_text_file_to_storage_atomic(sd_path, spiffs_path) == ESP_OK) {
     ESP_LOGI(TAG, "Copied Station.txt from SD to storage");
   } else {
     ESP_LOGW(TAG, "Failed to copy Station.txt from SD, using storage Station.txt");
@@ -623,6 +745,11 @@ static void sync_station_txt_from_sd_to_spiffs() {
 
 
 static esp_err_t copy_file_overwrite(const char* src_path, const char* dst_path) {
+  const bool lock_storage = storage_path_is_storage(src_path) || storage_path_is_storage(dst_path);
+  StorageLockGuard guard(lock_storage);
+  if (lock_storage && !guard.held()) return ESP_FAIL;
+  if (storage_path_is_storage(dst_path)) storage_warn_if_low_space_locked(dst_path);
+
   FILE* fs = fopen(src_path, "rb");
   if (!fs) return ESP_FAIL;
 
@@ -672,6 +799,9 @@ static esp_err_t copy_file_overwrite_retry(const char* src_path, const char* dst
 
 static bool collect_spiffs_regular_files(std::vector<std::string>& out_files) {
   out_files.clear();
+  {
+  StorageLockGuard guard;
+  if (!guard.held()) return false;
   DIR* d = opendir("/storage");
   if (!d) return false;
 
@@ -685,6 +815,7 @@ static bool collect_spiffs_regular_files(std::vector<std::string>& out_files) {
     out_files.emplace_back(name);
   }
   closedir(d);
+  }
   std::sort(out_files.begin(), out_files.end());
   return true;
 }
@@ -697,6 +828,21 @@ static std::string today_qso_file_name() {
   snprintf(name, sizeof(name), "%04d%02d%02d.txt",
            (t.tm_year + 1900) % 10000, (t.tm_mon + 1) % 100, t.tm_mday % 100);
   return name;
+}
+
+static std::string storage_basename(const std::string& name_or_path) {
+  size_t slash = name_or_path.find_last_of('/');
+  if (slash == std::string::npos) return name_or_path;
+  return name_or_path.substr(slash + 1);
+}
+
+static bool storage_is_active_log_name(const std::string& name_or_path) {
+  const std::string name = storage_basename(name_or_path);
+  char rt_path[64];
+  build_rxtx_log_path(rt_path, sizeof(rt_path));
+  return name == storage_basename(rt_path) ||
+         name == today_qso_file_name() ||
+         name == "fieldday.txt";
 }
 
 // Copy all regular files from internal storage -> SD card, overwriting destination.
@@ -751,7 +897,7 @@ static CopyLogsResult copy_logs_spiffs_to_sd_overwrite() {
   const std::string qso_name = today_qso_file_name();
   const std::string qso_src = std::string("/storage/") + qso_name;
   struct stat qso_st;
-  if (stat(qso_src.c_str(), &qso_st) == 0 && S_ISREG(qso_st.st_mode)) {
+  if (storage_safe_stat(qso_src.c_str(), &qso_st) == ESP_OK && S_ISREG(qso_st.st_mode)) {
     const std::string qso_dst = std::string("/sdcard/") + qso_name;
     esp_err_t err = copy_file_overwrite_retry(qso_src.c_str(), qso_dst.c_str(), 6, 100);
     set_copy_status(qso_name, err);
@@ -988,7 +1134,7 @@ static bool rewrite_dxpedition_for_mycall(const std::string& raw_text,
 }
 
 static const char* TAG = "FT8";
-enum class UIMode { RX, TX, BAND, MENU, MSC, DEBUG, STATUS, QSO, GPS };
+enum class UIMode { RX, TX, BAND, MENU, MSC, DEBUG, STATUS, QSO, GPS, PERF };
 static UIMode ui_mode = UIMode::RX;
 static int tx_page = 0;
 // NOTE: previous `std::vector<UiRxLine> g_rx_lines` was removed to eliminate
@@ -1027,6 +1173,13 @@ volatile int g_target_slot_parity = 0;   // 0=even, 1=odd - parity of slot to TX
 static volatile bool g_was_txing = false;       // We were transmitting (for tick timing)
 volatile bool g_decode_in_progress = false; // Block TX trigger while decoding
 static int g_last_slot_parity = -1;             // For slot boundary detection (just parity, like reference)
+
+static volatile uint32_t g_perf_idle_count[2] = {0, 0};
+static uint32_t g_perf_prev_idle_count[2] = {0, 0};
+static TickType_t g_perf_prev_sample_tick = 0;
+static uint8_t g_perf_cpu_busy_pct[2] = {0, 0};
+static bool g_perf_cpu_hook_ok[2] = {false, false};
+static bool g_perf_cpu_sample_valid = false;
 
 // BeaconMode and BandItem now defined in station_types.h
 #include "station_types.h"
@@ -1150,6 +1303,7 @@ static bool is_startup_direct_mode_key(char c) {
     case 'O':
     case 'B':
     case 'F':
+    case 'P':
     case 'C':
     case 'D':
       return true;
@@ -1185,6 +1339,7 @@ static QueueHandle_t s_key_inject_queue = nullptr;
 static bool host_bin_active = false;
 static size_t host_bin_remaining = 0;
 static FILE* host_bin_fp = nullptr;
+static bool host_bin_storage_locked = false;
 static uint32_t host_bin_crc = 0;
 static uint32_t host_bin_expected_crc = 0;
 static size_t host_bin_received = 0;
@@ -1267,7 +1422,15 @@ static bool g_tx_cat_ok = false;           // CAT available for this TX
 static int g_tx_last_ta_int = -1;          // For TA command deduplication
 static int g_tx_last_ta_frac = -1;
 
-static SemaphoreHandle_t log_mutex = NULL;                       // Protects log_rxtx_line file access
+static bool storage_should_guard_active_logs() {
+  return g_rxtx_log || g_tx_active || g_decode_in_progress ||
+         audio_source_is_streaming() || host_bin_active;
+}
+
+static bool storage_reject_active_log_user_mutation(const std::string& name_or_path) {
+  return storage_should_guard_active_logs() && storage_is_active_log_name(name_or_path);
+}
+
 static int menu_page = 0;
 static int menu_edit_idx = -1;
 static std::string menu_edit_buf;
@@ -1316,13 +1479,38 @@ static void qso_load_entries(const std::string& path);
 static void qso_draw_page();
 
 static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& text, int repeat_counter = -1);
-static void log_adif_entry(const std::string& dxcall, const std::string& dxgrid, int rst_sent, int rst_rcvd);
+static bool log_adif_entry(const std::string& dxcall, const std::string& dxgrid, int rst_sent, int rst_rcvd);
+static bool storage_append_text_locked_path(const std::string& path,
+                                            const std::string& line,
+                                            const std::string& header_if_new,
+                                            bool sync_to_flash);
+static bool storage_write_cabrillo_fd_entry(const std::string& mycall,
+                                            const std::string& location,
+                                            const std::string& qso_line);
 #if !MIC_PROBE_APP
 void log_heap(const char* tag) {
   size_t free_sz = heap_caps_get_free_size(MALLOC_CAP_8BIT);
   size_t min_free = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
   size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
   ESP_LOGI(tag, "HEAP: free=%u min=%u largest=%u", (unsigned)free_sz, (unsigned)min_free, (unsigned)largest);
+}
+static void log_mem_caps(const char* tag) {
+  size_t free_8bit = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  size_t largest_8bit = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+  size_t free_dma = heap_caps_get_free_size(MALLOC_CAP_DMA);
+  size_t largest_dma = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
+  size_t min_8bit = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+  ESP_LOGI(tag,
+           "MEM: 8bit_free=%u 8bit_largest=%u internal_free=%u internal_largest=%u dma_free=%u dma_largest=%u 8bit_min=%u",
+           (unsigned)free_8bit,
+           (unsigned)largest_8bit,
+           (unsigned)free_internal,
+           (unsigned)largest_internal,
+           (unsigned)free_dma,
+           (unsigned)largest_dma,
+           (unsigned)min_8bit);
 }
 static std::string fd_trim(const std::string& s) {
   size_t a = 0, b = s.size();
@@ -1345,28 +1533,31 @@ static std::string fd_get_section_from_exchange(const std::string& ex) {
   return fd_trim(t.substr(sp + 1));
 }
 
-static void cabrillo_fd_ensure_header(const char* path, const std::string& mycall, const std::string& location) {
+static esp_err_t cabrillo_fd_ensure_header_locked(const char* path, const std::string& mycall, const std::string& location) {
   struct stat st;
-  if (stat(path, &st) == 0) return;
+  if (stat(path, &st) == 0 && st.st_size > 0) return ESP_OK;
 
   FILE* f = fopen(path, "w");
-  if (!f) return;
+  if (!f) return ESP_FAIL;
 
-  fprintf(f, "START-OF-LOG: 3.0\n");
-  fprintf(f, "CREATED-BY: Mini-FT8\n");
-  fprintf(f, "CONTEST: ARRL-FIELD-DAY\n");
-  fprintf(f, "CALLSIGN: %s\n", mycall.c_str());
-  fprintf(f, "CATEGORY-OPERATOR: SINGLE-OP\n");
-  fprintf(f, "CATEGORY-TRANSMITTER: ONE\n");
-  fprintf(f, "CATEGORY-ASSISTED: NON-ASSISTED\n");
-  fprintf(f, "CATEGORY-BAND: ALL\n");
-  fprintf(f, "CATEGORY-MODE: MIXED\n");
-  fprintf(f, "CATEGORY-POWER: LOW\n");
-  fprintf(f, "CATEGORY-STATION: PORTABLE\n");
-  fprintf(f, "LOCATION: %s\n", location.c_str());
-  fprintf(f, "OPERATORS: %s\n", mycall.c_str());
-  fprintf(f, "END-OF-LOG:\n");
-  fclose(f);
+  int ok = 1;
+  ok &= (fprintf(f, "START-OF-LOG: 3.0\n") >= 0);
+  ok &= (fprintf(f, "CREATED-BY: Mini-FT8\n") >= 0);
+  ok &= (fprintf(f, "CONTEST: ARRL-FIELD-DAY\n") >= 0);
+  ok &= (fprintf(f, "CALLSIGN: %s\n", mycall.c_str()) >= 0);
+  ok &= (fprintf(f, "CATEGORY-OPERATOR: SINGLE-OP\n") >= 0);
+  ok &= (fprintf(f, "CATEGORY-TRANSMITTER: ONE\n") >= 0);
+  ok &= (fprintf(f, "CATEGORY-ASSISTED: NON-ASSISTED\n") >= 0);
+  ok &= (fprintf(f, "CATEGORY-BAND: ALL\n") >= 0);
+  ok &= (fprintf(f, "CATEGORY-MODE: MIXED\n") >= 0);
+  ok &= (fprintf(f, "CATEGORY-POWER: LOW\n") >= 0);
+  ok &= (fprintf(f, "CATEGORY-STATION: PORTABLE\n") >= 0);
+  ok &= (fprintf(f, "LOCATION: %s\n", location.c_str()) >= 0);
+  ok &= (fprintf(f, "OPERATORS: %s\n", mycall.c_str()) >= 0);
+  ok &= (fprintf(f, "END-OF-LOG:\n") >= 0);
+  if (ok) ok &= (fflush(f) == 0 && fsync(fileno(f)) == 0);
+  if (fclose(f) != 0) ok = 0;
+  return ok ? ESP_OK : ESP_FAIL;
 }
 
 static bool cabrillo_fd_truncate_end_marker(FILE* f) {
@@ -1409,11 +1600,11 @@ static bool cabrillo_fd_truncate_end_marker(FILE* f) {
   return true;
 }
 
-static void cabrillo_fd_append_qso_with_end(const char* path, const std::string& qso_line) {
+static esp_err_t cabrillo_fd_append_qso_with_end_locked(const char* path, const std::string& qso_line) {
   FILE* f = fopen(path, "r+");
   if (!f) {
     f = fopen(path, "a+");
-    if (!f) return;
+    if (!f) return ESP_FAIL;
   }
 
   // Remove trailing END-OF-LOG if present
@@ -1434,20 +1625,22 @@ static void cabrillo_fd_append_qso_with_end(const char* path, const std::string&
     }
   }
 
-  fprintf(f, "%s\n", qso_line.c_str());
-  fprintf(f, "END-OF-LOG:\n");
-  fclose(f);
+  bool ok = (fprintf(f, "%s\n", qso_line.c_str()) >= 0);
+  ok = ok && (fprintf(f, "END-OF-LOG:\n") >= 0);
+  ok = ok && (fflush(f) == 0 && fsync(fileno(f)) == 0);
+  if (fclose(f) != 0) ok = false;
+  return ok ? ESP_OK : ESP_FAIL;
 }
 
 // Called by autoseq when an FD QSO completes. We derive freq/time from current radio state
 // and use FreeText as our FD exchange (e.g. "1B SCV").
-static void log_cabrillo_fd_entry(const std::string& dxcall, const std::string& their_fd_exchange) {
-  if (g_cq_type != CqType::CQFD) return;
+static bool log_cabrillo_fd_entry(const std::string& dxcall, const std::string& their_fd_exchange) {
+  if (g_cq_type != CqType::CQFD) return true;
 
   const std::string my_fd = fd_strip_R(g_free_text);
   const std::string their_fd = fd_strip_R(their_fd_exchange);
 
-  if (my_fd.empty() || their_fd.empty() || dxcall.empty()) return;
+  if (my_fd.empty() || their_fd.empty() || dxcall.empty()) return false;
 
   // Time (UTC assumed as RTC timebase, same as ADIF writer)
   time_t now = (time_t)(rtc_now_ms() / 1000);
@@ -1464,10 +1657,7 @@ static void log_cabrillo_fd_entry(const std::string& dxcall, const std::string& 
   // Frequency: use selected band dial frequency (kHz)
   int freq_khz = (int)g_bands[g_band_sel].freq;
 
-  const char* path = "/storage/fieldday.txt";
-
   std::string location = fd_get_section_from_exchange(my_fd);
-  cabrillo_fd_ensure_header(path, g_call, location);
 
   char qso_line[128];
   snprintf(qso_line, sizeof(qso_line), "QSO: %d DG %s %s %s %s %s %s",
@@ -1479,18 +1669,70 @@ static void log_cabrillo_fd_entry(const std::string& dxcall, const std::string& 
            dxcall.c_str(),
            their_fd.c_str());
 
-  cabrillo_fd_append_qso_with_end(path, qso_line);
+  return storage_write_cabrillo_fd_entry(g_call, location, qso_line);
 }
 
 #else
 static inline void log_heap(const char*) {}
+static inline void log_mem_caps(const char*) {}
+static bool log_cabrillo_fd_entry(const std::string&, const std::string&) { return true; }
 #endif
+
+static bool storage_append_text_locked_path(const std::string& path,
+                                            const std::string& line,
+                                            const std::string& header_if_new,
+                                            bool sync_to_flash) {
+  StorageLockGuard guard;
+  if (!guard.held()) return false;
+
+  storage_warn_if_low_space_locked(path.c_str());
+
+  bool need_header = false;
+  if (!header_if_new.empty()) {
+    struct stat st;
+    need_header = (stat(path.c_str(), &st) != 0 || st.st_size == 0);
+  }
+
+  FILE* f = fopen(path.c_str(), "a");
+  if (!f) return false;
+
+  bool ok = true;
+  if (need_header) {
+    ok = fwrite(header_if_new.data(), 1, header_if_new.size(), f) == header_if_new.size();
+  }
+  if (ok && !line.empty()) {
+    ok = fwrite(line.data(), 1, line.size(), f) == line.size();
+  }
+  if (ok && sync_to_flash) {
+    ok = (fflush(f) == 0 && fsync(fileno(f)) == 0);
+  }
+  if (fclose(f) != 0) ok = false;
+  return ok;
+}
+
+static bool storage_write_cabrillo_fd_entry(const std::string& mycall,
+                                            const std::string& location,
+                                            const std::string& qso_line) {
+#if !MIC_PROBE_APP
+  const char* path = "/storage/fieldday.txt";
+  StorageLockGuard guard;
+  if (!guard.held()) return false;
+
+  storage_warn_if_low_space_locked(path);
+  esp_err_t err = cabrillo_fd_ensure_header_locked(path, mycall, location);
+  if (err != ESP_OK) return false;
+  return cabrillo_fd_append_qso_with_end_locked(path, qso_line) == ESP_OK;
+#else
+  (void)mycall;
+  (void)location;
+  (void)qso_line;
+  return true;
+#endif
+}
 
 static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& text, int repeat_counter) {
   if (!g_rxtx_log) return;
-  if (!log_mutex) return;  // Not initialized yet
 
-  // Prepare log line outside mutex
   time_t now = (time_t)(rtc_now_ms() / 1000);
   struct tm t;
   localtime_r(&now, &t);
@@ -1503,35 +1745,20 @@ static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& t
   char log_path[64];
   build_rxtx_log_path(log_path, sizeof(log_path));
 
-  // Take mutex for file access
-  if (xSemaphoreTake(log_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
-    ESP_LOGW(TAG, "RxTxLog mutex timeout");
-    return;
-  }
-
-  FILE* f = fopen(log_path, "a");
-  if (!f) {
-    ESP_LOGW(TAG, "RxTxLog open failed: %s", log_path);
-    xSemaphoreGive(log_mutex);
-    return;
-  }
-
-  // For TX, omit SNR and repeat; for RX keep SNR.
+  char line[256];
   if (dir == 'T') {
-    fprintf(f, "%c [%s][%.3f] %s %d\n",
-            dir, ts, freq_mhz, text.c_str(), offset_hz);
+    snprintf(line, sizeof(line), "%c [%s][%.3f] %s %d\n",
+             dir, ts, freq_mhz, text.c_str(), offset_hz);
   } else {
-    fprintf(f, "%c [%s][%.3f] %s %d %d\n",
-            dir, ts, freq_mhz, text.c_str(), snr, offset_hz);
+    snprintf(line, sizeof(line), "%c [%s][%.3f] %s %d %d\n",
+             dir, ts, freq_mhz, text.c_str(), snr, offset_hz);
   }
-
-  fclose(f);
-  xSemaphoreGive(log_mutex);
+  (void)repeat_counter;
+  (void)storage_append_text_locked_path(log_path, line, "", false);
 }
 
 static bool log_gps_grid_line(const std::string& grid8) {
   if (!g_rxtx_log) return false;
-  if (!log_mutex) return false;
   if (grid8.size() != 8) return false;
 
   // GPS grid breadcrumbs use RT files but not log_rxtx_line(), which appends
@@ -1548,23 +1775,11 @@ static bool log_gps_grid_line(const std::string& grid8) {
   char log_path[64];
   build_rxtx_log_path(log_path, sizeof(log_path));
 
-  if (xSemaphoreTake(log_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
-    ESP_LOGW(TAG, "GPS grid log mutex timeout");
-    return false;
-  }
-
-  FILE* f = fopen(log_path, "a");
-  if (!f) {
-    ESP_LOGW(TAG, "GPS grid log open failed: %s", log_path);
-    xSemaphoreGive(log_mutex);
-    return false;
-  }
-
-  fprintf(f, "G [%s][%.3f] %s\n", ts, freq_mhz, grid8.c_str());
-  fclose(f);
-  xSemaphoreGive(log_mutex);
-  ESP_LOGI(TAG, "GPS grid logged: %s", grid8.c_str());
-  return true;
+  char line[128];
+  snprintf(line, sizeof(line), "G [%s][%.3f] %s\n", ts, freq_mhz, grid8.c_str());
+  bool ok = storage_append_text_locked_path(log_path, line, "", false);
+  if (ok) ESP_LOGI(TAG, "GPS grid logged: %s", grid8.c_str());
+  return ok;
 }
 
 static bool is_daily_qso_txt_file(const char* name) {
@@ -1580,6 +1795,12 @@ static void qso_load_file_list() {
   g_q_files.clear();
   g_q_entries.clear();
   g_q_lines.clear();
+  {
+    StorageLockGuard guard;
+    if (!guard.held()) {
+      g_q_lines.push_back("Storage busy");
+      return;
+    }
   DIR* dir = opendir("/storage");
   if (!dir) {
     g_q_lines.push_back("No QSO logs");
@@ -1593,6 +1814,7 @@ static void qso_load_file_list() {
     }
   }
   closedir(dir);
+  }
   std::sort(g_q_files.begin(), g_q_files.end(), std::greater<std::string>());
   if (g_q_files.empty()) {
     g_q_lines.push_back("No QSO logs");
@@ -1605,6 +1827,9 @@ static void qso_load_file_list() {
 
 static void load_spiffs_regular_files(std::vector<std::string>& files) {
   files.clear();
+  {
+  StorageLockGuard guard;
+  if (!guard.held()) return;
   DIR* dir = opendir("/storage");
   if (!dir) return;
   struct dirent* ent;
@@ -1617,6 +1842,7 @@ static void load_spiffs_regular_files(std::vector<std::string>& files) {
     files.emplace_back(name);
   }
   closedir(dir);
+  }
   std::sort(files.begin(), files.end(), std::greater<std::string>());
 }
 
@@ -1707,6 +1933,11 @@ static void qso_load_entries(const std::string& path) {
   g_q_entries.clear();
   g_q_lines.clear();
   std::string full = std::string("/storage/") + path;
+  StorageLockGuard guard;
+  if (!guard.held()) {
+    g_q_lines.push_back("Storage busy");
+    return;
+  }
   FILE* f = fopen(full.c_str(), "r");
   if (!f) {
     g_q_lines.push_back("Open fail");
@@ -1775,17 +2006,7 @@ static void qso_draw_page() {
   }
 }
 
-static void log_adif_entry(const std::string& dxcall, const std::string& dxgrid, int rst_sent, int rst_rcvd) {
-  // Protect ADIF file access with the same mutex used for RxTxLog.
-  // log_qso_if_needed can be called from the UAC streaming task (core 1)
-  // via generate_response, so concurrent writes must be serialized.
-  if (!log_mutex) return;
-  if (xSemaphoreTake(log_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
-    ESP_LOGW(TAG, "ADIF mutex timeout");
-    return;
-  }
-
-  // Build file name based on current date
+static bool log_adif_entry(const std::string& dxcall, const std::string& dxgrid, int rst_sent, int rst_rcvd) {
   time_t now = (time_t)(rtc_now_ms() / 1000);
   struct tm t;
   localtime_r(&now, &t);
@@ -1796,20 +2017,6 @@ static void log_adif_entry(const std::string& dxcall, const std::string& dxgrid,
   snprintf(date, sizeof(date), "%04d%02d%02d", year % 10000, month % 100, day % 100);
   char path[64];
   snprintf(path, sizeof(path), "/storage/%s.txt", date);
-
-  bool need_header = false;
-  struct stat st;
-  if (stat(path, &st) != 0) need_header = true;
-
-  FILE* f = fopen(path, "a");
-  if (!f) {
-    ESP_LOGW(TAG, "ADIF open failed");
-    xSemaphoreGive(log_mutex);
-    return;
-  }
-  if (need_header) {
-    fprintf(f, "ADIF EXPORT\n<eoh>\n");
-  }
 
   char time_on[16];
   int hour = t.tm_hour;
@@ -1834,17 +2041,20 @@ static void log_adif_entry(const std::string& dxcall, const std::string& dxgrid,
     snprintf(rst_rcvd_buf, sizeof(rst_rcvd_buf), "<rst_rcvd:%d>%d ",
              (int)snprintf(nullptr, 0, "%d", rst_rcvd), rst_rcvd);
   }
-  fprintf(f, "<call:%zu>%s <gridsquare:%zu>%s <mode:3>FT8<qso_date:8>%s <time_on:6>%s <freq:%zu>%s <station_callsign:%zu>%s <my_gridsquare:%zu>%s %s%s<comment:%zu>%s <eor>\n",
-          dxcall.size(), dxcall.c_str(),
-          dxgrid.size(), dxgrid.c_str(),
-          date, time_on,
-          strlen(freq_str), freq_str,
-          g_call.size(), g_call.c_str(),
-          my_grid4.size(), my_grid4.c_str(),
-          rst_sent_buf, rst_rcvd_buf,
-          comment_expanded.size(), comment_expanded.c_str());
-  fclose(f);
-  xSemaphoreGive(log_mutex);
+  char line[512];
+  snprintf(line, sizeof(line),
+           "<call:%zu>%s <gridsquare:%zu>%s <mode:3>FT8<qso_date:8>%s <time_on:6>%s <freq:%zu>%s <station_callsign:%zu>%s <my_gridsquare:%zu>%s %s%s<comment:%zu>%s <eor>\n",
+           dxcall.size(), dxcall.c_str(),
+           dxgrid.size(), dxgrid.c_str(),
+           date, time_on,
+           strlen(freq_str), freq_str,
+           g_call.size(), g_call.c_str(),
+           my_grid4.size(), my_grid4.c_str(),
+           rst_sent_buf, rst_rcvd_buf,
+           comment_expanded.size(), comment_expanded.c_str());
+  bool ok = storage_append_text_locked_path(path, line, "ADIF EXPORT\n<eoh>\n", true);
+  if (!ok) ESP_LOGW(TAG, "ADIF write failed: %s", path);
+  return ok;
 }
 
 
@@ -1934,6 +2144,7 @@ static const char* uart_mirror_mode_label(UIMode mode) {
     case UIMode::STATUS:  return "STATUS";
     case UIMode::QSO:     return "QSO";
     case UIMode::GPS:     return "GPS";
+    case UIMode::PERF:    return "PERF";
   }
   return "?";
 }
@@ -1976,6 +2187,11 @@ struct WAVHeader {
 
 [[maybe_unused]] static esp_err_t decode_wav(const char* path) {
   ESP_LOGI(TAG, "Decoding %s", path);
+  StorageLockGuard storage_guard(storage_path_is_storage(path));
+  if (storage_path_is_storage(path) && !storage_guard.held()) {
+    ESP_LOGE(TAG, "Storage busy opening %s", path);
+    return ESP_FAIL;
+  }
   FILE* f = fopen(path, "rb");
   if (!f) {
     ESP_LOGE(TAG, "Failed to open %s", path);
@@ -2298,7 +2514,10 @@ static bool start_rx_audio_for_current_radio(const char* reason, bool notify_cat
   debug_log_line(std::string("Audio start ") + mode);
   debug_log_line(std::string("Audio bind ") + backend);
 
+  const bool is_uac_backend = (std::strstr(backend, "uac") != nullptr);
+  if (is_uac_backend) log_mem_caps("UAC_BEFORE_START");
   if (!audio_source_start()) {
+    if (is_uac_backend) log_mem_caps("UAC_AFTER_START");
     ESP_LOGW(TAG, "RX audio start failed radio=%s backend=%s reason=%s",
              mode,
              backend,
@@ -2306,6 +2525,7 @@ static bool start_rx_audio_for_current_radio(const char* reason, bool notify_cat
     debug_log_line("Audio start fail");
     return false;
   }
+  if (is_uac_backend) log_mem_caps("UAC_AFTER_START");
 
   debug_log_line("Audio start ok");
   g_decode_enabled = true;
@@ -3996,6 +4216,155 @@ static void draw_status_view() {
   }
 }
 
+static bool perf_idle_hook_cpu0() {
+  g_perf_idle_count[0] = g_perf_idle_count[0] + 1u;
+  return true;
+}
+
+static bool perf_idle_hook_cpu1() {
+  g_perf_idle_count[1] = g_perf_idle_count[1] + 1u;
+  return true;
+}
+
+static uint8_t perf_busy_percent(uint32_t idle_delta, TickType_t tick_delta) {
+  if (tick_delta == 0) return 0;
+  uint32_t idle_pct = ((idle_delta * 100u) + ((uint32_t)tick_delta / 2u)) / (uint32_t)tick_delta;
+  if (idle_pct > 100u) idle_pct = 100u;
+  return (uint8_t)(100u - idle_pct);
+}
+
+static void perf_monitor_sample(TickType_t now_ticks) {
+  if (g_perf_prev_sample_tick == 0) {
+    g_perf_prev_sample_tick = now_ticks;
+    g_perf_prev_idle_count[0] = g_perf_idle_count[0];
+    g_perf_prev_idle_count[1] = g_perf_idle_count[1];
+    return;
+  }
+
+  TickType_t tick_delta = now_ticks - g_perf_prev_sample_tick;
+  if (tick_delta == 0) return;
+
+  for (int core = 0; core < 2; ++core) {
+    uint32_t idle_now = g_perf_idle_count[core];
+    uint32_t idle_delta = idle_now - g_perf_prev_idle_count[core];
+    g_perf_prev_idle_count[core] = idle_now;
+    if (g_perf_cpu_hook_ok[core]) {
+      g_perf_cpu_busy_pct[core] = perf_busy_percent(idle_delta, tick_delta);
+    }
+  }
+
+  g_perf_prev_sample_tick = now_ticks;
+  g_perf_cpu_sample_valid = g_perf_cpu_hook_ok[0] || g_perf_cpu_hook_ok[1];
+}
+
+static void perf_monitor_init() {
+  static bool initialized = false;
+  if (initialized) return;
+
+  esp_err_t err0 = esp_register_freertos_idle_hook_for_cpu(perf_idle_hook_cpu0, 0);
+  if (err0 == ESP_OK) {
+    g_perf_cpu_hook_ok[0] = true;
+  } else {
+    ESP_LOGW(TAG, "CPU0 perf idle hook failed: %s", esp_err_to_name(err0));
+  }
+
+#if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
+  esp_err_t err1 = esp_register_freertos_idle_hook_for_cpu(perf_idle_hook_cpu1, 1);
+  if (err1 == ESP_OK) {
+    g_perf_cpu_hook_ok[1] = true;
+  } else {
+    ESP_LOGW(TAG, "CPU1 perf idle hook failed: %s", esp_err_to_name(err1));
+  }
+#endif
+
+  g_perf_prev_sample_tick = xTaskGetTickCount();
+  g_perf_prev_idle_count[0] = g_perf_idle_count[0];
+  g_perf_prev_idle_count[1] = g_perf_idle_count[1];
+  initialized = true;
+}
+
+static uint16_t perf_color_for_pct(uint8_t pct) {
+  if (pct >= 85) return TFT_RED;
+  if (pct >= 65) return TFT_YELLOW;
+  return TFT_GREEN;
+}
+
+static unsigned perf_kib_rounded(size_t bytes) {
+  return (unsigned)((bytes + 512u) / 1024u);
+}
+
+static uint8_t perf_heap_used_pct(uint32_t caps, size_t free_bytes) {
+  size_t total = heap_caps_get_total_size(caps);
+  if (total == 0 || free_bytes >= total) return 0;
+  return (uint8_t)(((total - free_bytes) * 100u + (total / 2u)) / total);
+}
+
+static void perf_make_cpu_line(char* out, size_t out_len, int core) {
+  char bar[9];
+  uint8_t pct = g_perf_cpu_busy_pct[core];
+  int filled = g_perf_cpu_sample_valid && g_perf_cpu_hook_ok[core] ? (pct * 8 + 50) / 100 : 0;
+  if (filled < 0) filled = 0;
+  if (filled > 8) filled = 8;
+  for (int i = 0; i < 8; ++i) bar[i] = (i < filled) ? '#' : '-';
+  bar[8] = '\0';
+
+  if (g_perf_cpu_sample_valid && g_perf_cpu_hook_ok[core]) {
+    snprintf(out, out_len, "C%d %3u%% [%s]", core, (unsigned)pct, bar);
+  } else {
+    snprintf(out, out_len, "C%d --%% [%s]", core, bar);
+  }
+}
+
+static void perf_make_heap_line(char* out, size_t out_len, const char* label, uint32_t caps) {
+  size_t free_bytes = heap_caps_get_free_size(caps);
+  size_t largest = heap_caps_get_largest_free_block(caps);
+  uint8_t used_pct = perf_heap_used_pct(caps, free_bytes);
+  snprintf(out, out_len, "%s %3u%% F%uK L%uK",
+           label,
+           (unsigned)used_pct,
+           perf_kib_rounded(free_bytes),
+           perf_kib_rounded(largest));
+}
+
+static void draw_perf_view(bool force_redraw) {
+  static char last_lines[6][32] = {{0}};
+  char lines[6][32];
+  uint16_t colors[6] = {
+      perf_color_for_pct(g_perf_cpu_busy_pct[0]),
+      perf_color_for_pct(g_perf_cpu_busy_pct[1]),
+      TFT_WHITE,
+      TFT_WHITE,
+      TFT_WHITE,
+      TFT_WHITE,
+  };
+
+  perf_make_cpu_line(lines[0], sizeof(lines[0]), 0);
+  perf_make_cpu_line(lines[1], sizeof(lines[1]), 1);
+  perf_make_heap_line(lines[2], sizeof(lines[2]), "8B", MALLOC_CAP_8BIT);
+  perf_make_heap_line(lines[3], sizeof(lines[3]), "IN", MALLOC_CAP_INTERNAL);
+  perf_make_heap_line(lines[4], sizeof(lines[4]), "DM", MALLOC_CAP_DMA);
+  snprintf(lines[5], sizeof(lines[5]), "ST C%uK M%uK",
+           perf_kib_rounded(g_app_core0_stack_cur_free_bytes),
+           perf_kib_rounded(g_app_core0_stack_min_free_bytes));
+
+  const int line_h = 19;
+  const int start_y = 18 + 3 + 3;
+  M5.Display.startWrite();
+  M5.Display.setTextSize(2);
+  for (int i = 0; i < 6; ++i) {
+    ui_set_visible_text_line(i, lines[i]);
+    if (force_redraw || strcmp(last_lines[i], lines[i]) != 0) {
+      snprintf(last_lines[i], sizeof(last_lines[i]), "%s", lines[i]);
+      int y = start_y + i * line_h;
+      M5.Display.fillRect(0, y, 240, line_h, TFT_BLACK);
+      M5.Display.setTextColor(colors[i], TFT_BLACK);
+      M5.Display.setCursor(0, y);
+      M5.Display.printf("%s", lines[i]);
+    }
+  }
+  M5.Display.endWrite();
+}
+
 static void debug_ensure_hud_lines() {
   while (g_debug_lines.size() < DEBUG_HUD_LINES) {
     g_debug_lines.emplace_back();
@@ -4282,6 +4651,7 @@ static const char* ble_page_label(UIMode mode) {
     case UIMode::STATUS: return "STATUS";
     case UIMode::QSO: return "QSO";
     case UIMode::GPS: return "GPS";
+    case UIMode::PERF: return "PERF";
   }
   return "PAGE";
 }
@@ -4494,16 +4864,23 @@ static void ble_dump_qso_file(const std::string& file_name) {
   }
   (void)ble_dump_send_line(std::string("\n--- <") + file_name + "> ---");
 
-  FILE* f = fopen(full_path.c_str(), "r");
-  if (!f) {
-    (void)ble_dump_send_line("Open fail");
-  } else {
-    char line[512];
-    while (fgets(line, sizeof(line), f)) {
-      g_ble_dump_xfer.file_lines++;
-      (void)ble_dump_send_line(line);
+  {
+    StorageLockGuard guard;
+    if (!guard.held()) {
+      (void)ble_dump_send_line("Storage busy");
+    } else {
+      FILE* f = fopen(full_path.c_str(), "r");
+      if (!f) {
+        (void)ble_dump_send_line("Open fail");
+      } else {
+        char line[512];
+        while (fgets(line, sizeof(line), f)) {
+          g_ble_dump_xfer.file_lines++;
+          (void)ble_dump_send_line(line);
+        }
+        fclose(f);
+      }
     }
-    fclose(f);
   }
   (void)ble_dump_send_line("--- EOF ---");
   {
@@ -4864,43 +5241,67 @@ static void host_handle_line(const std::string& line_in) {
     content = trim_copy(content);
     if (fname.empty()) {
       send("ERROR: filename required");
+    } else if (cmd_up == "WRITE" && storage_reject_active_log_user_mutation(fname)) {
+      send("ERROR: active log protected");
     } else {
       std::string path = std::string("/storage/") + fname;
-      const char* mode = (cmd_up == "WRITE") ? "w" : "a";
-      FILE* f = fopen(path.c_str(), mode);
-      if (!f) send("ERROR: open failed");
-      else { fwrite(content.data(), 1, content.size(), f); fclose(f); send("OK"); }
+      if (cmd_up == "WRITE") {
+        send(storage_write_file_atomic(path.c_str(), content) == ESP_OK ? "OK" : "ERROR: write failed");
+      } else {
+        StorageLockGuard guard;
+        if (!guard.held()) send("ERROR: storage busy");
+        else {
+          storage_warn_if_low_space_locked(path.c_str());
+          FILE* f = fopen(path.c_str(), "a");
+          if (!f) send("ERROR: open failed");
+          else {
+            bool ok = fwrite(content.data(), 1, content.size(), f) == content.size();
+            ok = ok && (fflush(f) == 0 && fsync(fileno(f)) == 0);
+            ok = ok && (fclose(f) == 0);
+            send(ok ? "OK" : "ERROR: write failed");
+          }
+        }
+      }
     }
   } else if (cmd_up == "READ") {
     if (rest.empty()) send("ERROR: filename required");
     else {
       std::string path = std::string("/storage/") + rest;
-      FILE* f = fopen(path.c_str(), "r");
-      if (!f) send("ERROR: open failed");
+      StorageLockGuard guard;
+      if (!guard.held()) send("ERROR: storage busy");
       else {
-        char buf[128];
-        while (fgets(buf, sizeof(buf), f)) host_write_str(std::string(buf));
-        fclose(f);
-        //send("OK");
-        send_prompt = false;
+        FILE* f = fopen(path.c_str(), "r");
+        if (!f) send("ERROR: open failed");
+        else {
+          char buf[128];
+          while (fgets(buf, sizeof(buf), f)) host_write_str(std::string(buf));
+          fclose(f);
+          //send("OK");
+          send_prompt = false;
+        }
       }
     }
   } else if (cmd_up == "DELETE") {
     if (rest.empty()) send("ERROR: filename required");
+    else if (storage_reject_active_log_user_mutation(rest)) send("ERROR: active log protected");
     else {
       std::string path = std::string("/storage/") + rest;
-      if (unlink(path.c_str()) == 0) send("OK"); else send("ERROR: delete failed");
+      if (storage_safe_unlink(path.c_str()) == ESP_OK) send("OK"); else send("ERROR: delete failed");
     }
   } else if (cmd_up == "LIST") {
-    DIR* d = opendir("/storage");
-    if (!d) send("ERROR: opendir failed");
+    StorageLockGuard guard;
+    if (!guard.held()) send("ERROR: storage busy");
     else {
-      struct dirent* ent;
-      while ((ent = readdir(d)) != nullptr) {
-        send(ent->d_name);
+      DIR* d = opendir("/storage");
+      if (!d) send("ERROR: opendir failed");
+      else {
+        struct dirent* ent;
+        while ((ent = readdir(d)) != nullptr) {
+          send(ent->d_name);
+        }
+        closedir(d);
+        send("OK");
       }
-      closedir(d);
-      send("OK");
     }
   } else if (cmd_up == "WRITEBIN") {
     std::istringstream rs(rest);
@@ -4913,27 +5314,37 @@ static void host_handle_line(const std::string& line_in) {
       send("ERROR: filename, size, crc32_hex required");
     } else if (host_bin_active) {
       send("ERROR: binary upload in progress");
+    } else if (storage_reject_active_log_user_mutation(fname)) {
+      send("ERROR: active log protected");
     } else {
       std::string path = std::string("/storage/") + fname;
-      FILE* f = fopen(path.c_str(), "wb");
-      if (!f) {
-        send("ERROR: open failed");
+      if (!storage_lock_take()) {
+        send("ERROR: storage busy");
       } else {
-        host_bin_path = path;
-        host_bin_active = true;
-        host_bin_remaining = size;
-        host_bin_fp = f;
-        host_bin_crc = 0;
-        host_bin_expected_crc = crc_exp;
-        host_bin_received = 0;
-        host_bin_buf.clear();
-        host_bin_buf.reserve(HOST_BIN_CHUNK);
-        host_bin_chunk_expect = (host_bin_remaining < HOST_BIN_CHUNK) ? host_bin_remaining : HOST_BIN_CHUNK;
-        host_bin_first_filled = 0;
-        memset(host_bin_first8, 0, sizeof(host_bin_first8));
-        memset(host_bin_last8, 0, sizeof(host_bin_last8));
-        host_write_str("OK: send " + std::to_string(size) + " bytes, chunk " + std::to_string(HOST_BIN_CHUNK) + " +4crc\r\n");
-        send_prompt = false; // prompt after binary upload completes
+        host_bin_storage_locked = true;
+        storage_warn_if_low_space_locked(path.c_str());
+        FILE* f = fopen(path.c_str(), "wb");
+        if (!f) {
+          storage_lock_give();
+          host_bin_storage_locked = false;
+          send("ERROR: open failed");
+        } else {
+          host_bin_path = path;
+          host_bin_active = true;
+          host_bin_remaining = size;
+          host_bin_fp = f;
+          host_bin_crc = 0;
+          host_bin_expected_crc = crc_exp;
+          host_bin_received = 0;
+          host_bin_buf.clear();
+          host_bin_buf.reserve(HOST_BIN_CHUNK);
+          host_bin_chunk_expect = (host_bin_remaining < HOST_BIN_CHUNK) ? host_bin_remaining : HOST_BIN_CHUNK;
+          host_bin_first_filled = 0;
+          memset(host_bin_first8, 0, sizeof(host_bin_first8));
+          memset(host_bin_last8, 0, sizeof(host_bin_last8));
+          host_write_str("OK: send " + std::to_string(size) + " bytes, chunk " + std::to_string(HOST_BIN_CHUNK) + " +4crc\r\n");
+          send_prompt = false; // prompt after binary upload completes
+        }
       }
     }
   } else if (cmd_up == "DATE") {
@@ -5006,6 +5417,22 @@ static void host_handle_line(const std::string& line_in) {
   if (send_prompt) host_write_str(std::string(HOST_PROMPT));
 }
 
+static void host_bin_close_release() {
+  if (host_bin_fp) {
+    fflush(host_bin_fp);
+    fsync(fileno(host_bin_fp));
+    fclose(host_bin_fp);
+    host_bin_fp = nullptr;
+  }
+  host_bin_active = false;
+  host_bin_remaining = 0;
+  host_bin_buf.clear();
+  if (host_bin_storage_locked) {
+    storage_lock_give();
+    host_bin_storage_locked = false;
+  }
+}
+
 static void host_process_bytes(const uint8_t* buf, size_t len) {
   ESP_LOGD(TAG, "host_process_bytes len=%u", (unsigned)len);
   for (size_t i = 0; i < len; ) {
@@ -5048,11 +5475,7 @@ static void host_process_bytes(const uint8_t* buf, size_t len) {
             host_bin_buf[payload_len + 3]
           };
           host_debug_hex8("DBG CRC BYTES", crc_bytes);
-          fclose(host_bin_fp);
-          host_bin_fp = nullptr;
-          host_bin_active = false;
-          host_bin_remaining = 0;
-          host_bin_buf.clear();
+          host_bin_close_release();
           host_write_str(std::string(HOST_PROMPT));
           continue;
         }
@@ -5079,11 +5502,7 @@ static void host_process_bytes(const uint8_t* buf, size_t len) {
         size_t written = fwrite(host_bin_buf.data(), 1, payload_len, host_bin_fp);
         if (written != payload_len) {
           host_write_str("ERROR: write failed\r\n");
-          fclose(host_bin_fp);
-          host_bin_fp = nullptr;
-          host_bin_active = false;
-          host_bin_remaining = 0;
-          host_bin_buf.clear();
+          host_bin_close_release();
           host_write_str(std::string(HOST_PROMPT));
           continue;
         }
@@ -5094,10 +5513,8 @@ static void host_process_bytes(const uint8_t* buf, size_t len) {
         host_write_str("ACK " + std::to_string(host_bin_received) + "\r\n");
 
         if (host_bin_remaining == 0) {
-          fclose(host_bin_fp);
-          host_bin_fp = nullptr;
-          host_bin_active = false;
           uint32_t crc_final = host_bin_crc;
+          host_bin_close_release();
           // Reopen file to send first/last 8 bytes for debugging
           host_debug_hex8("DBG FIRST8", host_bin_first8);
           host_debug_hex8("DBG LAST8", host_bin_last8);
@@ -5146,6 +5563,8 @@ static void host_process_bytes(const uint8_t* buf, size_t len) {
 }
 
 static RadioType load_station_radio_type_only() {
+  StorageLockGuard guard;
+  if (!guard.held()) return canonical_radio_type(g_radio);
   FILE* f = fopen(STATION_FILE, "r");
   if (!f) return canonical_radio_type(g_radio);
 
@@ -5174,17 +5593,24 @@ static void load_station_data() {
   g_grid_from_gps = false;
   g_grid_gps_display8.clear();
 
-  FILE* f = fopen(STATION_FILE, "r");
-  if (!f) {
-    autoseq_set_max_retry(g_autoseq_max_retry);
-    apply_ble_enabled_policy(false);
-    return;
-  }
-  char line[128];
-  while (fgets(line, sizeof(line), f)) {
-    int idx = -1;
-    int val = 0;
-    if (sscanf(line, "band%d=%d", &idx, &val) == 2) {
+  {
+    StorageLockGuard guard;
+    if (!guard.held()) {
+      autoseq_set_max_retry(g_autoseq_max_retry);
+      apply_ble_enabled_policy(false);
+      return;
+    }
+    FILE* f = fopen(STATION_FILE, "r");
+    if (!f) {
+      autoseq_set_max_retry(g_autoseq_max_retry);
+      apply_ble_enabled_policy(false);
+      return;
+    }
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+      int idx = -1;
+      int val = 0;
+      if (sscanf(line, "band%d=%d", &idx, &val) == 2) {
       if (idx >= 0 && idx < (int)g_bands.size()) {
         g_bands[idx].freq = val;
       }
@@ -5244,8 +5670,9 @@ static void load_station_data() {
         g_rtc_sleep_epoch = (time_t)epoch_tmp;
       }
     }
+    }
+    fclose(f);
   }
-  fclose(f);
   autoseq_set_max_retry(g_autoseq_max_retry);
   // Try hardware RTC first (persists through deep sleep), fall back to saved strings
   if (!rtc_init_from_hw()) {
@@ -5263,37 +5690,36 @@ void save_station_data() {
     g_config_save_pending = true;
     return;
   }
-  FILE* f = fopen(STATION_FILE, "w");
-  if (!f) {
-    ESP_LOGE(TAG, "Failed to open %s for write", STATION_FILE);
-    return;
-  }
+  std::ostringstream out;
   for (size_t i = 0; i < g_bands.size(); ++i) {
-    fprintf(f, "band%u=%d\n", (unsigned)i, g_bands[i].freq);
+    out << "band" << (unsigned)i << "=" << g_bands[i].freq << "\n";
   }
   // Beacon is not persisted (stays OFF on reload)
-  fprintf(f, "offset=%d\n", g_offset_hz);
-  fprintf(f, "band_sel=%d\n", g_band_sel);
-  fprintf(f, "date=%s\n", g_date.c_str());
-  fprintf(f, "time=%s\n", g_time.c_str());
-  fprintf(f, "cq_type=%d\n", (int)g_cq_type);
-  fprintf(f, "cq_ft=%s\n", g_cq_freetext.c_str());
-  fprintf(f, "skiptx1=%d\n", g_skip_tx1 ? 1 : 0);
-  fprintf(f, "free_text=%s\n", g_free_text.c_str());
-  fprintf(f, "call=%s\n", g_call.c_str());
-  fprintf(f, "grid=%s\n", g_grid_saved_manual.c_str());
-  fprintf(f, "offset_src=%d\n", (int)g_offset_src);
-  fprintf(f, "radio=%d\n", (int)canonical_radio_type(g_radio));
-  fprintf(f, "gps_baud=%d\n", normalize_gps_baud_value(g_gps_baud));
-  fprintf(f, "comment1=%s\n", g_comment1.c_str());
-  fprintf(f, "ignore_prefixes=%s\n", g_ignore_prefix_text.c_str());
-  fprintf(f, "rxtx_log=%d\n", g_rxtx_log ? 1 : 0);
-  fprintf(f, "active_bands=%s\n", g_active_band_text.c_str());
-  fprintf(f, "rtc_sleep_epoch=%lld\n", (long long)g_rtc_sleep_epoch);
-  fprintf(f, "rtc_comp=%d\n", g_rtc_comp);
-  fprintf(f, "autoseq_max_retry=%d\n", g_autoseq_max_retry);
-  fprintf(f, "ble_enabled=%d\n", g_ble_enabled ? 1 : 0);
-  fclose(f);
+  out << "offset=" << g_offset_hz << "\n";
+  out << "band_sel=" << g_band_sel << "\n";
+  out << "date=" << g_date << "\n";
+  out << "time=" << g_time << "\n";
+  out << "cq_type=" << (int)g_cq_type << "\n";
+  out << "cq_ft=" << g_cq_freetext << "\n";
+  out << "skiptx1=" << (g_skip_tx1 ? 1 : 0) << "\n";
+  out << "free_text=" << g_free_text << "\n";
+  out << "call=" << g_call << "\n";
+  out << "grid=" << g_grid_saved_manual << "\n";
+  out << "offset_src=" << (int)g_offset_src << "\n";
+  out << "radio=" << (int)canonical_radio_type(g_radio) << "\n";
+  out << "gps_baud=" << normalize_gps_baud_value(g_gps_baud) << "\n";
+  out << "comment1=" << g_comment1 << "\n";
+  out << "ignore_prefixes=" << g_ignore_prefix_text << "\n";
+  out << "rxtx_log=" << (g_rxtx_log ? 1 : 0) << "\n";
+  out << "active_bands=" << g_active_band_text << "\n";
+  out << "rtc_sleep_epoch=" << (long long)g_rtc_sleep_epoch << "\n";
+  out << "rtc_comp=" << g_rtc_comp << "\n";
+  out << "autoseq_max_retry=" << g_autoseq_max_retry << "\n";
+  out << "ble_enabled=" << (g_ble_enabled ? 1 : 0) << "\n";
+  if (storage_write_file_atomic(STATION_FILE, out.str()) != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to write %s", STATION_FILE);
+    return;
+  }
   // Every config mutation in the Cardputer UI funnels through here, so this
   // is the canonical place to notify core_api consumers.
   core_fire_config_changed();
@@ -5384,6 +5810,9 @@ static void enter_mode(UIMode new_mode) {
       break;
     case UIMode::GPS:
       draw_gps_view(true);
+      break;
+    case UIMode::PERF:
+      draw_perf_view(true);
       break;
   }
 }
@@ -5658,10 +6087,15 @@ static void begin_usb_host_mode() {
   if (!audio_source_is_streaming()) {
     debug_log_line("UAC2 start");
     apply_radio_profile_binding();
+    const char* backend = audio_source_backend_name(audio_source_get_backend());
+    const bool is_uac_backend = (std::strstr(backend, "uac") != nullptr);
     debug_log_line("UAC2 bind");
+    if (is_uac_backend) log_mem_caps("UAC_BEFORE_START");
     if (!audio_source_start()) {
+      if (is_uac_backend) log_mem_caps("UAC_AFTER_START");
       debug_log_line("UAC2 afail");
     } else {
+      if (is_uac_backend) log_mem_caps("UAC_AFTER_START");
       debug_log_line("UAC2 aok");
       g_decode_enabled = true;
       ui_set_paused(false);
@@ -5724,6 +6158,17 @@ static bool storage_supports_msc() {
   return s_storage_backend == StorageBackend::FAT;
 }
 
+static void storage_warn_if_low_space_locked(const char* context) {
+  if (s_storage_backend != StorageBackend::SPIFFS) return;
+  size_t total = 0;
+  size_t used = 0;
+  esp_err_t err = esp_spiffs_info("spiffs", &total, &used);
+  if (err == ESP_OK && total > 0 && used * 4 >= total * 3) {
+    ESP_LOGW("STORAGE", "SPIFFS usage high before %s: used=%u total=%u",
+             context ? context : "write", (unsigned)used, (unsigned)total);
+  }
+}
+
 static esp_err_t mount_storage() {
   if (storage_is_mounted()) return ESP_OK;
 
@@ -5749,11 +6194,16 @@ static esp_err_t mount_storage() {
       conf.base_path = "/storage";
       conf.partition_label = "spiffs";
       conf.max_files = 5;
-      conf.format_if_mount_failed = true;
+      conf.format_if_mount_failed = false;
       esp_err_t err = esp_vfs_spiffs_register(&conf);
       if (err == ESP_OK) {
         s_storage_mounted = true;
         ESP_LOGI("STORAGE", "Mounted SPIFFS partition 'spiffs' at /storage (MSC unavailable on launcher install)");
+        storage_warn_if_low_space_locked("mount");
+      } else {
+        ESP_LOGE("STORAGE", "SPIFFS mount failed without formatting: %s", esp_err_to_name(err));
+        esp_err_t check_err = esp_spiffs_check("spiffs");
+        ESP_LOGW("STORAGE", "esp_spiffs_check('spiffs') returned %s", esp_err_to_name(check_err));
       }
       return err;
     }
@@ -5784,8 +6234,8 @@ static void unmount_storage() {
 static void app_task_core0(void* /*param*/) {
   ESP_ERROR_CHECK(mount_storage());
 
-  // Initialize mutexes for thread-safe operations
-  log_mutex = xSemaphoreCreateMutex();
+  storage_mutex_init();
+  log_mem_caps("STORAGE_MUTEX_INIT");
 
   sync_station_txt_from_sd_to_spiffs();
   board_power_init();
@@ -5811,10 +6261,6 @@ static void app_task_core0(void* /*param*/) {
   // set both dirty flags so the next UI tick re-evaluates.
   core_on_config_changed([]{ g_rx_dirty = true; g_tx_view_dirty = true; });
   
-// Cabrillo Field Day log callback (implemented in autoseq.cpp; declared here to avoid header churn)
-using CabrilloFdLogCallback = void (*)(const std::string& dxcall, const std::string& their_fd_exchange);
-extern void autoseq_set_cabrillo_fd_callback(CabrilloFdLogCallback cb);
-
 autoseq_set_adif_callback(log_adif_entry);
 autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
 
@@ -5859,6 +6305,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     g_app_core0_stack_min_free_bytes = free_bytes;
     debug_update_app_core0_stack_hud(false);
   }
+  perf_monitor_init();
 
   // Key injection queue for console UART RX
   s_key_inject_queue = xQueueCreate(32, sizeof(char));
@@ -5960,6 +6407,10 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         g_app_core0_stack_min_free_bytes = free_bytes;
       }
       debug_update_app_core0_stack_hud(true);
+      perf_monitor_sample(now_ticks);
+      if (ui_mode == UIMode::PERF) {
+        draw_perf_view(false);
+      }
     }
     // Startup splash: show for kStartupAutoDismissMs, then auto-enter
     // USB-host mode (= STATUS -> '2'). A direct-mode key during the splash
@@ -6237,12 +6688,14 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
       else if (c == 'd' || c == 'D') { cancel_status_edit(); enter_mode(ui_mode == UIMode::DEBUG ? UIMode::RX : UIMode::DEBUG); switched = true; }
       else if (c == 's' || c == 'S') { cancel_status_edit(); enter_mode(ui_mode == UIMode::STATUS ? UIMode::RX : UIMode::STATUS); switched = true; }
       else if (c == 'g' || c == 'G') { cancel_status_edit(); enter_mode(ui_mode == UIMode::GPS ? UIMode::RX : UIMode::GPS); switched = true; }
+      else if (!c_from_ble && (c == 'p' || c == 'P')) { cancel_status_edit(); enter_mode(ui_mode == UIMode::PERF ? UIMode::RX : UIMode::PERF); switched = true; }
     }
 
   if (!switched && c) {
     // Mode-specific handling
     switch (ui_mode) {
       case UIMode::GPS: break;
+      case UIMode::PERF: break;
       case UIMode::RX: {
         int sel = ui_handle_rx_key(c);
         if (sel >= 0 && core_cmd_tap_rx(sel)) {
@@ -6428,7 +6881,9 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
             if (idx >= 0 && idx < (int)g_d_files.size()) {
               std::string deleted = g_d_files[idx];
               std::string path = std::string("/storage/") + deleted;
-              if (unlink(path.c_str()) == 0) {
+              if (storage_reject_active_log_user_mutation(deleted)) {
+                debug_log_line(std::string("Active log protected: ") + deleted);
+              } else if (storage_safe_unlink(path.c_str()) == ESP_OK) {
                 debug_log_line(std::string("Deleted: ") + deleted);
               } else {
                 debug_log_line(std::string("Delete failed: ") + deleted);

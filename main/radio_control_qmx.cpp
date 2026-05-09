@@ -75,7 +75,7 @@ static esp_err_t qmx_set_tone_hz(float tone_hz) {
     int ta_frac = (int)lrintf(frac * 100.0f); // 0..100 before clamp
     if (ta_frac > 99) ta_frac = 99;           // clamp: %02d is 2 digits max
 
-    char ta[16];
+    char ta[32];
     snprintf(ta, sizeof(ta), "TA%04d.%02d;", ta_int, ta_frac);
     return qmx_send_cmd(ta, 10);
 }

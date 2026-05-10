@@ -24,7 +24,8 @@ Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure betw
 
 73, Wei AG6AQ
 
-# Mini-FT8 Operation Manual (V2.0.2)
+# Mini-FT8 Operation Manual (V2.0.4)
+(Temporarily disabled BLE in V2.0.4, if you need it, please choose V2.0.4 in kh1_mic branch)
 
 ## Quick Mode Map
 
@@ -41,7 +42,8 @@ Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure betw
 | `F` | Fetch | Browse files and fetch or dump the selected file to the BLE client. |
 | `D` | Delete Files | Browse and delete files stored in SPIFFS. |
 | `B` | BAND | Edit per-band frequencies. |
-| `C` | Connect | Enter USB serial command mode. |
+| `C` | Connect | Enter USB serial command mode. (removed in V2.0.4)|
+| `P` | Performance | View A Simple Performance Monitor. (added in V2.0.4)|
 
 ## Global Keys and Navigation
 
@@ -121,7 +123,8 @@ Notes:
 | `F` (Fetch) | `1..6` | Select and send a file over BLE. |
 | `D` (Delete Files) | `1..6` | Delete the selected file immediately, without confirmation. |
 | `B` (BAND) | `1..6` | Choose a band slot to edit. |
-| `C` (Connect) |  | USB serial command mode for host commands. Available only before connecting to a radio. Type `help` on the PC to list host-side commands. |
+| `C` (Connect) |  | USB serial command mode for host commands. Available only before connecting to a radio. Type `help` on the PC to list host-side commands. (removed in V2.0.4)|
+| `P` (PERFORMANCE) | | A Simple Performance Monitor. (added in V2.0.4) |
 
 ## Download Logs
 

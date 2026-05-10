@@ -499,6 +499,7 @@ struct CopyLogsResult {
 };
 static esp_err_t copy_file_overwrite(const char* src_path, const char* dst_path);
 static void storage_warn_if_low_space_locked(const char* context);
+static bool storage_is_mounted();
 
 static void debug_log_line(const std::string& msg);
 //exported symbol (linkable from other .cpp)
@@ -719,6 +720,11 @@ static void sync_station_txt_from_sd_to_spiffs() {
   static const char* TAG = "FT8";
   if (g_station_txt_sync_attempted) return;
   g_station_txt_sync_attempted = true;
+
+  if (!storage_is_mounted()) {
+    ESP_LOGW(TAG, "Storage not mounted, skipping Station.txt SD sync");
+    return;
+  }
 
   if (ensure_sdcard_mounted() != ESP_OK) {
     ESP_LOGI(TAG, "SD not mounted, using storage Station.txt");
@@ -1221,6 +1227,7 @@ static void enter_msc_mode(const char* reason);
 static void host_handle_line(const std::string& line);
 void save_station_data();  // visible to core_api.cpp
 static bool storage_is_mounted();
+static bool storage_mount_was_attempted();
 static bool storage_supports_msc();
 static void unmount_storage();
 
@@ -1424,8 +1431,7 @@ static int g_tx_last_ta_int = -1;          // For TA command deduplication
 static int g_tx_last_ta_frac = -1;
 
 static bool storage_should_guard_active_logs() {
-  return g_rxtx_log || g_tx_active || g_decode_in_progress ||
-         audio_source_is_streaming() || host_bin_active;
+  return g_tx_active || g_decode_in_progress || audio_source_is_streaming() || host_bin_active;
 }
 
 static bool storage_reject_active_log_user_mutation(const std::string& name_or_path) {
@@ -5705,7 +5711,15 @@ static void load_station_data() {
 
 void save_station_data() {
   if (!storage_is_mounted()) {
-    g_config_save_pending = true;
+    if (!storage_mount_was_attempted()) {
+      g_config_save_pending = true;
+    } else {
+      static bool warned_once = false;
+      if (!warned_once) {
+        warned_once = true;
+        ESP_LOGW(TAG, "Storage unavailable; station data save skipped");
+      }
+    }
     return;
   }
   std::ostringstream out;
@@ -6155,6 +6169,7 @@ static void begin_usb_host_mode() {
 enum class StorageBackend : uint8_t { NONE, FAT, SPIFFS };
 static StorageBackend     s_storage_backend  = StorageBackend::NONE;
 static bool               s_storage_mounted  = false;
+static bool               s_storage_mount_attempted = false;
 static wl_handle_t        s_storage_wl_handle = WL_INVALID_HANDLE;
 
 static StorageBackend detect_storage_backend() {
@@ -6172,6 +6187,9 @@ static StorageBackend detect_storage_backend() {
 static bool storage_is_mounted() {
   return s_storage_mounted;
 }
+static bool storage_mount_was_attempted() {
+  return s_storage_mount_attempted;
+}
 static bool storage_supports_msc() {
   return s_storage_backend == StorageBackend::FAT;
 }
@@ -6188,6 +6206,7 @@ static void storage_warn_if_low_space_locked(const char* context) {
 }
 
 static esp_err_t mount_storage() {
+  s_storage_mount_attempted = true;
   if (storage_is_mounted()) return ESP_OK;
 
   s_storage_backend = detect_storage_backend();
@@ -6212,16 +6231,26 @@ static esp_err_t mount_storage() {
       conf.base_path = "/storage";
       conf.partition_label = "spiffs";
       conf.max_files = 5;
-      conf.format_if_mount_failed = false;
+      // Repartitioning moves SPIFFS to a new flash range, so first boot after
+      // the partition change needs to create a filesystem there.
+      conf.format_if_mount_failed = true;
       esp_err_t err = esp_vfs_spiffs_register(&conf);
       if (err == ESP_OK) {
         s_storage_mounted = true;
         ESP_LOGI("STORAGE", "Mounted SPIFFS partition 'spiffs' at /storage (MSC unavailable on launcher install)");
         storage_warn_if_low_space_locked("mount");
       } else {
-        ESP_LOGE("STORAGE", "SPIFFS mount failed without formatting: %s", esp_err_to_name(err));
+        ESP_LOGE("STORAGE", "SPIFFS mount failed after format-if-needed path: %s", esp_err_to_name(err));
         esp_err_t check_err = esp_spiffs_check("spiffs");
         ESP_LOGW("STORAGE", "esp_spiffs_check('spiffs') returned %s", esp_err_to_name(check_err));
+        if (check_err == ESP_OK) {
+          err = esp_vfs_spiffs_register(&conf);
+          if (err == ESP_OK) {
+            s_storage_mounted = true;
+            ESP_LOGI("STORAGE", "Mounted SPIFFS partition after esp_spiffs_check()");
+            storage_warn_if_low_space_locked("mount");
+          }
+        }
       }
       return err;
     }
@@ -6250,12 +6279,19 @@ static void unmount_storage() {
 }
 
 static void app_task_core0(void* /*param*/) {
-  ESP_ERROR_CHECK(mount_storage());
-
   storage_mutex_init();
   log_mem_caps("STORAGE_MUTEX_INIT");
 
-  sync_station_txt_from_sd_to_spiffs();
+  esp_err_t storage_err = mount_storage();
+  if (storage_err != ESP_OK) {
+    ESP_LOGE(TAG, "Storage mount failed: %s; continuing without log/config storage",
+             esp_err_to_name(storage_err));
+    debug_log_line("Storage mount fail");
+  }
+
+  if (storage_is_mounted()) {
+    sync_station_txt_from_sd_to_spiffs();
+  }
   board_power_init();
   g_radio = load_station_radio_type_only();
   ui_init(radio_type_uses_display_only(g_radio));
@@ -6899,19 +6935,26 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
             if (idx >= 0 && idx < (int)g_d_files.size()) {
               std::string deleted = g_d_files[idx];
               std::string path = std::string("/storage/") + deleted;
+              bool reload_list = true;
               if (storage_reject_active_log_user_mutation(deleted)) {
                 debug_log_line(std::string("Active log protected: ") + deleted);
+                if (idx < (int)g_d_lines.size()) g_d_lines[idx] = std::string("LOCK ") + deleted;
+                reload_list = false;
               } else if (storage_safe_unlink(path.c_str()) == ESP_OK) {
                 debug_log_line(std::string("Deleted: ") + deleted);
               } else {
                 debug_log_line(std::string("Delete failed: ") + deleted);
+                if (idx < (int)g_d_lines.size()) g_d_lines[idx] = std::string("FAIL ") + deleted;
+                reload_list = false;
               }
-              delete_load_file_list();
-              int max_page = 0;
-              if (!g_d_lines.empty()) {
-                max_page = ((int)g_d_lines.size() - 1) / 6;
+              if (reload_list) {
+                delete_load_file_list();
+                int max_page = 0;
+                if (!g_d_lines.empty()) {
+                  max_page = ((int)g_d_lines.size() - 1) / 6;
+                }
+                if (d_page > max_page) d_page = max_page;
               }
-              if (d_page > max_page) d_page = max_page;
               ui_draw_list(g_d_lines, d_page, -1);
             }
           }

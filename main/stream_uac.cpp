@@ -1,7 +1,6 @@
 #include "stream_uac.h"
 #include "ft8_audio_pipeline.h"
 #include "resample.h"
-#include "feature_flags.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -33,14 +32,7 @@ int64_t rtc_now_ms();
 #define UAC_TASK_PRIORITY       5
 #define UAC_STREAM_TASK_PRIORITY 4
 #define TASK_STACK_SIZE         4096
-// Stack for the ft8_audio_pipeline_run() task (calls decode_monitor_results()
-// inline). FT4's LDPC decode is ~2x heavier than FT8's; size for worst-case
-// so a single binary safely runs either protocol at boot time.
-#if ENABLE_FT4
-#define STREAM_TASK_STACK_SIZE 16384
-#else
 #define STREAM_TASK_STACK_SIZE  8192
-#endif
 
 // UAC read buffer size (bytes) - must be multiple of 288 (USB transfer size at 48kHz/24bit/stereo)
 // 288 bytes = 48 stereo samples per 1ms USB transfer, 2304 = 288 * 8

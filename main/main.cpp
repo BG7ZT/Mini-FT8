@@ -1275,7 +1275,7 @@ static std::vector<std::string> g_msc_lines = {
 };
 
 static std::vector<std::string> g_startup_lines = {
-    "** Mini-FT8 V2.0.1 *",
+    "** Mini-FT8 V2.0.4 *",
     " S/R/T: Operate",
     " M/N/O: Menu",
     " Q/F/D: File",
@@ -1326,6 +1326,7 @@ struct QsoLogEntry {
 };
 static QPageView g_q_page_view = QPageView::Default;
 static std::vector<QsoLogEntry> g_q_entries;
+static bool g_q_entries_have_next_page = false;
 static bool g_q_show_entries = false;
 static int q_page = 0;
 static std::string g_q_current_file;
@@ -1795,6 +1796,7 @@ static void qso_load_file_list() {
   g_q_files.clear();
   g_q_entries.clear();
   g_q_lines.clear();
+  g_q_entries_have_next_page = false;
   {
     StorageLockGuard guard;
     if (!guard.held()) {
@@ -1864,6 +1866,7 @@ static void qso_load_fetch_file_list() {
   g_q_files.clear();
   g_q_entries.clear();
   g_q_lines.clear();
+  g_q_entries_have_next_page = false;
   load_spiffs_regular_files(g_q_files);
   if (g_q_files.empty()) {
     g_q_lines.push_back("No storage files");
@@ -1932,6 +1935,7 @@ static void qso_rebuild_entry_lines() {
 static void qso_load_entries(const std::string& path) {
   g_q_entries.clear();
   g_q_lines.clear();
+  g_q_entries_have_next_page = false;
   std::string full = std::string("/storage/") + path;
   StorageLockGuard guard;
   if (!guard.held()) {
@@ -1943,6 +1947,9 @@ static void qso_load_entries(const std::string& path) {
     g_q_lines.push_back("Open fail");
     return;
   }
+  const int first_qso = std::max(0, q_page) * 6;
+  int qso_index = 0;
+  int page_count = 0;
   char line[512];
   while (fgets(line, sizeof(line), f)) {
     std::string s(line);
@@ -1950,6 +1957,11 @@ static void qso_load_entries(const std::string& path) {
     std::transform(s_lower.begin(), s_lower.end(), s_lower.begin(),
                    [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
     if (s_lower.find("<call:") == std::string::npos) continue;
+    if (qso_index++ < first_qso) continue;
+    if (page_count >= 6) {
+      g_q_entries_have_next_page = true;
+      break;
+    }
     auto get_field = [&](const std::string& tag)->std::string {
       size_t p = s_lower.find("<" + tag);
       if (p == std::string::npos) return "";
@@ -1991,6 +2003,7 @@ static void qso_load_entries(const std::string& path) {
     e.has_rst_rcvd = qso_parse_rst(rst_rcvd_raw, e.rst_rcvd);
     e.has_rst_sent = qso_parse_rst(rst_sent_raw, e.rst_sent);
     g_q_entries.push_back(e);
+    page_count++;
   }
   fclose(f);
   qso_rebuild_entry_lines();
@@ -1999,7 +2012,7 @@ static void qso_load_entries(const std::string& path) {
 static void qso_draw_page() {
   if (g_q_show_entries) {
     // Entry view: render raw QSO lines without "1..6 " prefixes.
-    ui_draw_debug(g_q_lines, q_page);
+    ui_draw_debug(g_q_lines, 0);
   } else {
     // File list view: keep numbered selection rows.
     ui_draw_list(g_q_lines, q_page, -1);
@@ -3069,7 +3082,7 @@ static void rtc_tick() {
           draw_status_line(4, std::string("Date: ") + g_date, false);
         }
         if (old_time != g_time) {
-          draw_status_line(5, std::string("Time: ") + g_time, false);
+          draw_status_line(5, std::string("Time: ") + g_time + (g_time_synced_from_gps ? " G" : ""), false);
         }
       }
     }
@@ -4203,12 +4216,12 @@ static void draw_status_view() {
   if (status_edit_idx == 4 && !status_edit_buffer.empty()) {
     lines[4] = std::string("Date: ") + highlight_pos(status_edit_buffer, status_cursor_pos);
   } else {
-    lines[4] = std::string("Date: ") + g_date + (g_time_synced_from_gps ? "G" : "");
+    lines[4] = std::string("Date: ") + g_date;
   }
   if (status_edit_idx == 5 && !status_edit_buffer.empty()) {
     lines[5] = std::string("Time: ") + highlight_pos(status_edit_buffer, status_cursor_pos);
   } else {
-    lines[5] = std::string("Time: ") + g_time;
+    lines[5] = std::string("Time: ") + g_time + (g_time_synced_from_gps ? " G" : "");
   }
   for (int i = 0; i < 6; ++i) {
     bool hl = (status_edit_idx == i);
@@ -4680,8 +4693,13 @@ static void ble_page_meta(int& cur, int& total) {
       cur = d_page + 1;
       break;
     case UIMode::QSO:
-      total = page_count((int)g_q_lines.size(), 6);
-      cur = q_page + 1;
+      if (g_q_show_entries) {
+        cur = q_page + 1;
+        total = cur + (g_q_entries_have_next_page ? 1 : 0);
+      } else {
+        total = page_count((int)g_q_lines.size(), 6);
+        cur = q_page + 1;
+      }
       break;
     default:
       break;
@@ -6927,9 +6945,9 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                   g_q_page_view = QPageView::Default;
                 }
                 g_q_current_file = selected_file;
-                qso_load_entries(g_q_current_file);
                 g_q_show_entries = true;
                 q_page = 0;
+                qso_load_entries(g_q_current_file);
                 qso_draw_page();
               }
             }
@@ -6947,9 +6965,9 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 qso_draw_page();
               }
             } else if (c == ';') {
-              if (q_page > 0) { q_page--; qso_draw_page(); }
+              if (q_page > 0) { q_page--; qso_load_entries(g_q_current_file); qso_draw_page(); }
             } else if (c == '.') {
-              if ((q_page + 1) * 6 < (int)g_q_lines.size()) { q_page++; qso_draw_page(); }
+              if (g_q_entries_have_next_page) { q_page++; qso_load_entries(g_q_current_file); qso_draw_page(); }
             } else if (c == '`') {
               // back to file list
               g_q_show_entries = false;

@@ -22,8 +22,7 @@ Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure betw
 
 73, Wei AG6AQ
 
-# Mini-FT8 Operation Manual (V2.0.4)
-(Temporarily disabled BLE in V2.0.4, if you need it, please choose V2.0.4 in kh1_mic branch)
+# Mini-FT8 Operation Manual
 
 ## Quick Mode Map
 
@@ -37,47 +36,19 @@ Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure betw
 | `N` | MENU P2 | Configure radio, input, and comment settings. |
 | `O` | MENU P3 | Configure logging, active bands, RTC, copy-to-SD, and retry settings. |
 | `Q` | QSO | Browse QSO and log files, and view entries. |
-| `F` | Fetch | Browse files and fetch or dump the selected file to the BLE client. |
 | `D` | Delete Files | Browse and delete files stored in SPIFFS. |
 | `B` | BAND | Edit per-band frequencies. |
-| `C` | Connect | Enter USB serial command mode. (removed in V2.0.4)|
+| `C` | USB Drive | Enter manual USB mass-storage mode when FAT storage is available. |
 | `P` | Performance | View A Simple Performance Monitor. (added in V2.0.4)|
 
 ## Global Keys and Navigation
 
-- `R` / `T` / `B` / `S` / `G` / `Q` / `F` / `D` / `C`: switch to the selected mode. Press the same mode key again to return to `RX`.
+- `R` / `T` / `B` / `S` / `G` / `Q` / `D` / `C`: switch to the selected mode. Press the same mode key again to return to `RX`.
 - `M` / `N` / `O`: jump to MENU page 1 / 2 / 3. Press the current page key again to return to `RX`.
 - `` ` ``: cancel TX globally in `RX`, `TX`, and `STATUS` when not editing.
-- `▲` / `▼`: page up / page down in `RX`, `TX`, `BAND`, `MENU`, `QSO`, `Fetch`, and `Delete`.
+- `▲` / `▼`: page up / page down in `RX`, `TX`, `BAND`, `MENU`, `QSO`, and `Delete`.
 - `◀` / `▶`: move left / right in `QSO-SNR`, `STATUS` date/time, `MENU P2` (N->2).
 - `1`..`6`: always select the currently visible row in the active mode.
-
-### BLE Terminal
-
- You can operate Mini-FT8 entirely from Bluetooth(BLE)
- 
- Tested: App Store: BLE Terminal HM-10 by Gopi Gadhiya
- 
-- `E`: cancel current TX 
-- `u` / `v`: page up / page down
-- `z` / `x`: move left / right (`QSO-SNR`)
-
-## BLE Screen Layout
-
-1. Text waterfall frame:
-   ```text
-   =============================  (29 `=` frame boundary)
-   |                           |  (27 bins inside the bars)
-   ----.----+----.----+----.---+  (29-character scale with 500 Hz tick marks)
-   ```
-2. Line 7 meta/edit line:
-   - normal: [MODE uv] (`u` / `v` show page-up / page-down availability; `-` means not available)
-   - text edit mode: [Edit <item>] (edit in the BLE terminal, then press Enter to save; ESC is not available)
-
-Notes:
-- Waterfall bins use `space`, `.`, `:`, and `!` to indicate signal strength, about 100 Hz per bin.
-- Counter symbols: `|` (slot boundary), `4`, `8`, `12`, `:` (even slot), `.` (odd slot), `o` (TX indicator).
-- Decoded message count: [D:n]
 
 ## Per-Mode Controls
 
@@ -109,7 +80,7 @@ Notes:
 |  | `3` | Select radio (`QMX` / `KH1`). |
 |  | `4` | Edit ignore list (Long Edit). Prefixes are separated by spaces; maximum 64 characters. |
 |  | `5` | Edit comment (Long Edit). Used for ADIF logging. Supports `/Radio` and `/Grid` macro expansion. |
-|  | `6` | Turn BLE on/off. Device name is `Mini-FT8-<callsign>`. |
+|  | `6` | Reserved. |
 | `O` (MENU P3) | `1` | Turn RxTx log on/off. Note: RxTxLog has been renamed to `RT[YYMMDD].txt`. |
 |  | `2` | Turn SkipTX1 on/off. Skips `dxcall mycall mygrid` and replies with the SNR report. |
 |  | `3` | Edit active bands (Long Edit). Used by STATUS -> Band. |
@@ -118,10 +89,9 @@ Notes:
 |  | `6` | Edit max retry (in place). Accepts any natural number or `0`. |
 | `Q` (QSO) | `1..6` | Open the selected ADIF file. |
 |  | `◀` `▶` | Switch columns (Default view or SNR view). |
-| `F` (Fetch) | `1..6` | Select and send a file over BLE. |
 | `D` (Delete Files) | `1..6` | Delete the selected file immediately, without confirmation. |
 | `B` (BAND) | `1..6` | Choose a band slot to edit. |
-| `C` (Connect) |  | USB serial command mode for host commands. Available only before connecting to a radio. Type `help` on the PC to list host-side commands. (removed in V2.0.4)|
+| `C` (USB Drive) |  | Stop radio audio and expose FAT log storage to the PC until reboot. Unavailable on launcher installs using SPIFFS. |
 | `P` (PERFORMANCE) | | A Simple Performance Monitor. (added in V2.0.4) |
 
 ## Download Logs
@@ -130,10 +100,6 @@ Notes:
   - Insert a FAT/FAT32-formatted SD card.
   - In MENU P3 (`O`), press `5` (Copy files to SD). All files will be copied to the SD card.
   - If the result shows `Missed`, a reboot will usually fix it.
-
-- Use BLE
-  - In the BLE Terminal, send `F` and choose the file.
-  - Use "Send Log File" in the BLE Terminal to save or email it.
 
 - Use `pc_terminal.py`
   - On the M5 Cardputer, press `C` to enter communication mode.

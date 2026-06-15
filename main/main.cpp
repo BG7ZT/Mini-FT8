@@ -73,7 +73,6 @@ extern "C" {
 static const char* STATION_FILE = "/storage/Station.txt";
 static sdmmc_card_t* g_sd_card = NULL;
 static bool g_sd_mounted = false;
-static bool g_ble_enabled = true;
 
 #include "feature_flags.h"
 
@@ -1220,9 +1219,6 @@ static constexpr uint32_t APP_CORE0_STACK_BYTES = 12288; // Tune to 16384/18432 
 static TickType_t g_app_core0_stack_last_sample_tick = 0;
 static uint32_t g_app_core0_stack_cur_free_bytes = 0;
 static uint32_t g_app_core0_stack_min_free_bytes = 0;
-static bool g_ble_qso_pick_mode = false;
-static bool g_ble_dump_in_progress = false;
-static UIMode g_ble_qso_return_mode = UIMode::RX;
 
 static void enter_msc_mode(const char* reason);
 static void host_handle_line(const std::string& line);
@@ -3592,7 +3588,6 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     ui_set_rx_list_static(nullptr, 0);
     if (update_ui) { ui_draw_rx(); }
     else core_fire_rx_changed();  // propagates to all registered consumers (Cardputer, future BLE)
-    ble_publish_decode_event(0);
     // No candidates means we processed the slot's audio but found nothing —
     // still counts as "applied" for the TX-trigger guard.
     if (g_decode_slot_idx > g_decode_applied_slot_idx) {
@@ -3796,7 +3791,6 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
   } else {
     core_fire_rx_changed();  // propagates to all registered consumers (Cardputer, future BLE)
   }
-  ble_publish_decode_event(s_dec_count);
 
   // ---- heap instrumentation (exit) ----
   {
@@ -4118,7 +4112,7 @@ static void draw_menu_view() {
   lines.push_back(std::string("Radio:") + radio_name(g_radio));
   lines.push_back(std::string("IgnoreList:") + head_trim(g_ignore_prefix_text, 10));
   lines.push_back(std::string("C:") + head_trim(expand_comment1(), 16));
-  lines.push_back(std::string("BLE ") + (g_ble_enabled ? "ON" : "OFF"));
+  lines.push_back("USB:Manual S->2");
 
   // Page 2 content (index 12+)
   lines.push_back(std::string("RxTxLog:") + (g_rxtx_log ? "ON" : "OFF"));
@@ -5634,7 +5628,6 @@ static void load_station_data() {
   // Load-time defaults for runtime settings.
   g_rtc_comp = kRtcCompFixed;
   g_autoseq_max_retry = AUTOSEQ_MAX_RETRY;
-  g_ble_enabled = true;
   g_gps_baud = 115200;
   g_grid_saved_manual = g_grid;
   g_grid_from_gps = false;
@@ -5644,13 +5637,11 @@ static void load_station_data() {
     StorageLockGuard guard;
     if (!guard.held()) {
       autoseq_set_max_retry(g_autoseq_max_retry);
-      apply_ble_enabled_policy(false);
       return;
     }
     FILE* f = fopen(STATION_FILE, "r");
     if (!f) {
       autoseq_set_max_retry(g_autoseq_max_retry);
-      apply_ble_enabled_policy(false);
       return;
     }
     char line[128];
@@ -5707,8 +5698,6 @@ static void load_station_data() {
       g_active_band_text = trim_upper_copy(line + 13);
     } else if (sscanf(line, "autoseq_max_retry=%d", &val) == 1) {
       if (val >= 0) g_autoseq_max_retry = val;
-    } else if (sscanf(line, "ble_enabled=%d", &val) == 1) {
-      g_ble_enabled = (val != 0);
     } else if (sscanf(line, "rtc_comp=%d", &val) == 1) {
       g_rtc_comp = clamp_rtc_comp_value(val);
     } else {
@@ -5729,7 +5718,6 @@ static void load_station_data() {
   rebuild_active_bands();
   rebuild_ignore_prefixes();
   g_beacon = BeaconMode::OFF; // force off on load
-  apply_ble_enabled_policy(false);
 }
 
 void save_station_data() {
@@ -5770,7 +5758,6 @@ void save_station_data() {
   out << "rtc_sleep_epoch=" << (long long)g_rtc_sleep_epoch << "\n";
   out << "rtc_comp=" << g_rtc_comp << "\n";
   out << "autoseq_max_retry=" << g_autoseq_max_retry << "\n";
-  out << "ble_enabled=" << (g_ble_enabled ? 1 : 0) << "\n";
   if (storage_write_file_atomic(STATION_FILE, out.str()) != ESP_OK) {
     ESP_LOGE(TAG, "Failed to write %s", STATION_FILE);
     return;
@@ -5812,10 +5799,6 @@ static void enter_mode(UIMode new_mode) {
     // path (UART CAT has no discrete "first connect" event).
     sync_radio_to_current_band("STATUS exit");
   }
-  if (new_mode != UIMode::QSO) {
-    g_ble_qso_pick_mode = false;
-    g_ble_dump_in_progress = false;
-  }
   ui_mode = new_mode;
   rx_flash_idx = -1;
   switch (ui_mode) {
@@ -5850,11 +5833,7 @@ static void enter_mode(UIMode new_mode) {
     case UIMode::QSO:
       g_q_show_entries = false;
       q_page = 0;
-      if (g_ble_qso_pick_mode) {
-        qso_load_fetch_file_list();
-      } else {
-        qso_load_file_list();
-      }
+      qso_load_file_list();
       qso_draw_page();
       break;
     case UIMode::STATUS:
@@ -6035,24 +6014,8 @@ static void ble_commit_text_input(const BleUiInput& input) {
 }
 #endif
 
-// "No QMX in N seconds -> enter MSC mode" timer.
-// Set when begin_usb_host_mode arms it; cleared once we either see a QMX
-// enumerate (mic or CDC handle) or after we've fallen back. Used by the
-// main loop's periodic check below.
-static bool    g_qmx_detect_active     = false;
-static int64_t g_qmx_detect_deadline_ms = 0;
-static constexpr int64_t kQmxDetectTimeoutMs = 10000;
-
-// CDC-FAIL watchdog: armed when UAC audio comes up (QMX mic detected) but CAT
-// CDC hasn't connected yet. Fires 10 s later; if CDC is still absent, logs a
-// warning (JTAG serial is still up even when USB host mode blocks CDC).
-static bool    g_cdc_check_active      = false;
-static int64_t g_cdc_check_deadline_ms = 0;
-static constexpr int64_t kCdcCheckDelayMs = 10000;
-
 // Switch to MSC (USB Mass Storage) mode. This is a one-way transition:
-// BLE controller memory is released and USB-OTG is re-claimed as a device
-// port until reboot.
+// USB-OTG is re-claimed as a device port until reboot.
 //
 // Gated on the storage backend: TinyUSB MSC needs a wear-levelled FAT volume,
 // so on launcher-installed images (legacy SPIFFS partition) MSC is
@@ -6061,7 +6024,6 @@ static constexpr int64_t kCdcCheckDelayMs = 10000;
 // keypresses as reboot triggers and show stale "USB drive mounted" text
 // without the actual device-mode driver running.
 static void enter_msc_mode(const char* reason) {
-  g_qmx_detect_active = false;
   if (!storage_supports_msc()) {
     ESP_LOGW(TAG, "MSC requested (%s) but storage backend is SPIFFS — MSC unavailable on launcher installs", reason);
     debug_log_line("MSC needs FAT storage");
@@ -6072,8 +6034,6 @@ static void enter_msc_mode(const char* reason) {
   audio_source_stop();
   // Small settle window so the USB host teardown can release the PHY.
   vTaskDelay(pdMS_TO_TICKS(200));
-
-  nimble_teardown();
 
   if (g_config_save_pending) {
     g_config_save_pending = false;
@@ -6131,12 +6091,9 @@ static void enter_msc_mode(const char* reason) {
 
 // Perform the STATUS -> '2' action: start the UAC audio source that feeds
 // the QMX (or KH1) into the decoder, and sync CAT to the currently selected
-// band. Shared between the on-device keypress path and the 1 s splash
-// auto-dismiss on boot.
+// band.
 static void begin_usb_host_mode() {
-  // The status-view feedback only makes sense when we're actually on the
-  // STATUS page (manual S -> '2' path). The splash auto-dismiss lands on
-  // RX, so skip the status redraws to avoid painting over the RX view.
+  // The status-view feedback only makes sense on the STATUS page.
   const bool on_status_page = (ui_mode == UIMode::STATUS);
   if (on_status_page) {
     status_edit_idx = 1;
@@ -6164,15 +6121,6 @@ static void begin_usb_host_mode() {
       ui_clear_waterfall();
       esp_err_t rc = radio_control_on_audio_start();
       debug_log_line(rc == ESP_OK ? "UAC2 catok" : "UAC2 catng");
-      // Headless-friendly fallback: arm a 10 s "no-QMX" timer when the
-      // selected radio is QMX. If neither the UAC mic nor the CDC-ACM
-      // endpoint enumerates by then, the main loop enters MSC so the PC
-      // sees the log partition as a USB drive. Gated on QMX so KH1-MIC
-      // does not trip the fallback.
-      if (canonical_radio_type(g_radio) == RadioType::QMX) {
-        g_qmx_detect_deadline_ms = esp_timer_get_time() / 1000 + kQmxDetectTimeoutMs;
-        g_qmx_detect_active = true;
-      }
     }
   }
   int freq_hz = g_bands[g_band_sel].freq * 1000;
@@ -6351,23 +6299,6 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
 
   ui_mode = UIMode::RX;
   load_station_data();
-  init_bluetooth();
-  // Boot-time DRAM headroom check. NimBLE can consume ~50 KB of internal DRAM;
-  // if free DIRAM falls below 30 KB after init the CDC-ACM allocator will likely
-  // fail silently when the QMX enumerates. Surface this immediately on the startup
-  // screen (visible without a serial connection) so the failure mode is obvious.
-  {
-    size_t free_diram = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    constexpr size_t kDiramWarnThresholdBytes = 30 * 1024;
-    if (free_diram < kDiramWarnThresholdBytes) {
-      char warn[32];
-      snprintf(warn, sizeof(warn), "LOW DRAM: %u KB", (unsigned)(free_diram / 1024));
-      ESP_LOGW(TAG, "%s (MALLOC_CAP_INTERNAL|8BIT) — CDC-ACM may fail to allocate", warn);
-      g_startup_lines.push_back(warn);
-      ui_draw_debug(g_startup_lines, 0);  // repaint splash with the warning appended
-    }
-  }
-  apply_ble_enabled_policy(true);
   apply_radio_profile_binding();
   update_autoseq_cq_type();
 
@@ -6472,29 +6403,6 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
       s_uart_mirror_fire = true;  // fire on the next iteration
     }
 #endif
-    if (c == 0) {
-      BleUiInput ble_input{};
-      if (ble_pop_input(ble_input)) {
-#if ENABLE_BLE
-        if (!g_ble_enabled || g_ble_dump_in_progress) {
-          c_from_ble = false;
-        } else {
-          c_from_ble = true;
-          last_key = 0;  // allow repeated BLE commands without local debounce suppression
-          if (g_ble_text_mode) {
-            ble_commit_text_input(ble_input);
-          } else {
-            c = ble_parse_ui_command(ble_input.data, ble_input.len);
-            if (c == 0) c_from_ble = false;
-          }
-        }
-#endif
-      }
-    }
-
-    // BLE remote UI push model: always compare and send latest 7-line snapshot when changed.
-    ble_mirror_tick();
-    ble_countdown_tick();
     gps_runtime_tick();
     TickType_t now_ticks = xTaskGetTickCount();
     if ((now_ticks - g_app_core0_stack_last_sample_tick) >= pdMS_TO_TICKS(1000)) {
@@ -6511,10 +6419,8 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         draw_perf_view(false);
       }
     }
-    // Startup splash: show for kStartupAutoDismissMs, then auto-enter
-    // USB-host mode (= STATUS -> '2'). A direct-mode key during the splash
-    // window still short-circuits — most usefully 'c', which drops into the
-    // MSC instead of starting the QMX audio path.
+    // Startup splash: show briefly, then remain in RX. Radio connection is
+    // explicit through STATUS -> 2; direct-mode keys still work immediately.
     if (g_startup_active) {
       if (g_startup_start_ms == 0) {
         g_startup_start_ms = esp_timer_get_time() / 1000;
@@ -6537,12 +6443,10 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
       } else {
         const int64_t now_ms = esp_timer_get_time() / 1000;
         if (now_ms - g_startup_start_ms >= kStartupAutoDismissMs) {
-          // No key within the window — auto-start USB host mode and land
-          // on the RX page.
+          // No key within the window: dismiss the splash and remain in RX.
           g_startup_active = false;
           save_station_data();
           enter_mode(UIMode::RX);
-          begin_usb_host_mode();
           ui_force_redraw_rx();
           ui_draw_rx();
           last_key = 0;
@@ -6561,54 +6465,10 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     check_slot_boundary();  // TX trigger at slot boundary (matching reference architecture)
     tx_tick();              // Process TX state machine (single-threaded, non-blocking)
 
-    // Drain deferred config saves requested by the BLE RPC dispatch.
-    // Clear before saving so a write that lands during the save just
-    // re-arms us for the next tick (we never lose an update; we may
-    // re-save once unnecessarily, which is fine).
+    // Drain deferred config saves requested by core commands.
     if (g_config_save_pending) {
       g_config_save_pending = false;
       save_station_data();
-    }
-
-    // No-QMX fallback: if begin_usb_host_mode armed the timer and nothing
-    // has enumerated by the deadline, switch to MSC so a button-less
-    // StampS3Bat can still expose logs to the host PC. Only fires when the
-    // storage backend is FAT (esptool full-flash deployments). On launcher
-    // installs (SPIFFS backend) MSC is not functional, so we just clear the
-    // flag and stay in normal RX UI — the user can still drive menus / BLE.
-    if (g_qmx_detect_active) {
-      if (audio_source_qmx_detected()) {
-        g_qmx_detect_active = false;
-        ESP_LOGI(TAG, "QMX detected; staying in USB host mode");
-        // Arm CDC-FAIL watchdog: if CAT CDC doesn't connect within 10 s of
-        // audio coming up, log a warning (suggests CDC-ACM allocation failure,
-        // often caused by DRAM pressure from NimBLE).
-        if (!cat_cdc_ready()) {
-          g_cdc_check_deadline_ms = esp_timer_get_time() / 1000 + kCdcCheckDelayMs;
-          g_cdc_check_active = true;
-        }
-      } else if (esp_timer_get_time() / 1000 >= g_qmx_detect_deadline_ms) {
-        if (storage_supports_msc()) {
-          enter_msc_mode("no QMX after 10s");
-        } else {
-          g_qmx_detect_active = false;
-          ESP_LOGI(TAG, "No QMX detected after 10s — staying in RX (MSC unavailable on launcher install)");
-        }
-      }
-    }
-
-    // CDC-FAIL watchdog: fires 10 s after QMX audio enumerated without CAT CDC.
-    // Clears once CDC connects (normal case) or after the warning fires once.
-    if (g_cdc_check_active) {
-      if (cat_cdc_ready()) {
-        g_cdc_check_active = false;  // connected normally, all good
-      } else if (esp_timer_get_time() / 1000 >= g_cdc_check_deadline_ms) {
-        g_cdc_check_active = false;
-        size_t free_diram = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        ESP_LOGW(TAG, "CDC FAIL: CAT CDC not ready 10s after QMX audio connect "
-                      "(free DIRAM=%u KB) — likely CDC-ACM allocation failure due to DRAM pressure",
-                      (unsigned)(free_diram / 1024));
-      }
     }
 
     if (ui_mode == UIMode::MSC) {
@@ -6776,16 +6636,6 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
           if (menu_page < 2) menu_page++;  // first "."
           if (menu_page < 2) menu_page++;  // second "."
           draw_menu_view();
-        }
-        switched = true;
-      }
-      else if (c == 'f' || c == 'F') {
-        cancel_status_edit();
-        if (ui_mode == UIMode::QSO && g_ble_qso_pick_mode) {
-          g_ble_qso_return_mode = UIMode::RX;
-          ble_cancel_qso_pick_mode();
-        } else {
-          ble_start_qso_pick_mode();
         }
         switched = true;
       }
@@ -7167,9 +7017,6 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                     autoseq_set_max_retry(g_autoseq_max_retry);
                   }
                 }
-                if (menu_edit_idx == 3) {
-                  ble_update_name_from_station(true);
-                }
                 if (should_save) {
                   save_station_data();
                 }
@@ -7373,11 +7220,6 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
 #if ENABLE_BLE
                   if (c_from_ble) ble_enter_text_mode();
 #endif
-                } else if (c == '6') {
-                  g_ble_enabled = !g_ble_enabled;
-                  apply_ble_enabled_policy(true);
-                  save_station_data();
-                  draw_menu_view();
                 }
             } else if (menu_page == 2) {
               if (c == '1') {

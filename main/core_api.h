@@ -4,7 +4,7 @@
 // core_api.h
 //
 // Functional-core API for Mini-FT8. UI-agnostic — consumed by both the
-// Cardputer local UI and the BLE server. No screen-rendering or terminal
+// Cardputer local UI and other control surfaces. No screen-rendering or terminal
 // concepts leak through this boundary.
 //
 // Consumers follow the "notify + pull" pattern:
@@ -147,7 +147,7 @@ void core_get_rx_list(std::vector<RxDecodeEntry>& out);
 void core_get_qso(QsoSnapshot& out);
 
 // Non-allocating QSO accessors. Consumers that can't tolerate the
-// std::vector<QsoEntry>::reserve inside core_get_qso (e.g. the BLE
+// std::vector<QsoEntry>::reserve inside core_get_qso (e.g. an external
 // QSO_QUEUE read handler running under heap fragmentation) iterate
 // active entries via core_qso_active_count + core_qso_get_active. The
 // strings inside QsoEntry / NextTxEntry are FT8 callsigns and grids

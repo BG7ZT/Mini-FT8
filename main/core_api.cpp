@@ -3,7 +3,7 @@
 //
 // Thin adapter over the existing main.cpp / autoseq.cpp / ui.cpp internals.
 // No behavioral change; just exposes a UI-agnostic surface to consumers
-// (Cardputer local UI + future BLE server).
+// (Cardputer local UI and future control surfaces).
 //
 // See core_api.h for the public contract and docs/NATIVE_CLIENT_ARCHITECTURE.md
 // for the high-level design.
@@ -64,7 +64,7 @@ bool ui_get_rx_entry(int idx, RxDecodeEntry* out);
 // ---------------------------------------------------------------------------
 
 namespace {
-// Multi-slot registry so Cardputer and BLE server can coexist.
+// Multi-slot registry so multiple consumers can coexist.
 // No remove API — consumers live for the app lifetime.
 constexpr int kMaxConsumers = 4;
 CoreChangeCb    g_cb_rx_changed     [kMaxConsumers] = {};
@@ -210,7 +210,7 @@ void core_get_rx_list(std::vector<RxDecodeEntry>& out) {
   }
 }
 
-// Defined in main.cpp. Read by core_get_qso so the BLE snapshot reflects
+// Defined in main.cpp. Read by core_get_qso so snapshots reflect
 // the firmware's resolved offset, not autoseq's pre-resolution placeholder.
 extern AutoseqTxEntry g_pending_tx;
 extern bool           g_pending_tx_valid;
@@ -241,7 +241,7 @@ bool core_qso_get_next_tx(NextTxEntry& out) {
   // resolved offset (matching the actual TX, including the random roll
   // for RANDOM mode and beacon CQ). autoseq's own pending entry only
   // holds the *unresolved* offset (often 0 for fresh CQs), which is
-  // what was reaching BLE before and pinning the marker at the config
+  // what was reaching external consumers before and pinning the marker at the config
   // default.
   if (g_pending_tx_valid && !g_pending_tx.text.empty()) {
     out.valid             = true;
@@ -364,7 +364,7 @@ void core_fire_waterfall_row(int sym,
 // ---------------------------------------------------------------------------
 
 // Save deferral: every save_station_data call below would otherwise run
-// on the ble_native task, whose 4 KB stack can't accommodate the 22-
+// on a shallow caller task whose stack may not accommodate the 22-
 // fprintf chain in save_station_data plus filesystem internals. Set the
 // flag instead — the main UI loop on the deeper app_task_core0 stack
 // drains it within ~10 ms.
@@ -456,9 +456,9 @@ bool core_cmd_set_band(int band_idx) {
   if (!apply_config_write([&]{ g_band_sel = band_idx; })) return false;
   // The Cardputer defers the CAT push to STATUS exit because S->3 is a
   // tap-cycle through bands (each press would otherwise click the KH1
-  // antenna relay). The BLE client picks a band from a dropdown — one
+  // antenna relay). External clients pick a band in one operation, so
   // intentional change — so commit to the radio immediately.
-  sync_radio_to_current_band("BLE set_band");
+  sync_radio_to_current_band("core set_band");
   return true;
 }
 

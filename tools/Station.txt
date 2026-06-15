@@ -29,4 +29,3 @@ active_bands=80 40 20 17 15 12 10
 rtc_sleep_epoch=0
 rtc_comp=120
 autoseq_max_retry=3
-ble_enabled=1

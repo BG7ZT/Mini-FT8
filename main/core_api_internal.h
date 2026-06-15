@@ -5,7 +5,7 @@
 //
 // Internal hooks called by the functional-core implementation and by the
 // existing mutation sites in main.cpp / stream_uac.cpp. NOT a public API —
-// external consumers (Cardputer UI, BLE server) use core_api.h.
+// external consumers use core_api.h.
 //
 // These helpers exist so that changes produced inside main.cpp's legacy
 // code paths can also wake up registered core_on_*_changed() callbacks

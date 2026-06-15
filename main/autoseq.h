@@ -161,12 +161,12 @@ void autoseq_on_tx_starting();
 void autoseq_get_qso_states(std::vector<std::string>& out);
 
 // Copy the full active-zone QsoContext entries for structured consumers
-// (e.g. the core_api / BLE server). Returns active contexts only; inactive
+// (e.g. the core_api). Returns active contexts only; inactive
 // zone is not included. Thread-safe snapshot.
 void autoseq_get_active_contexts(std::vector<QsoContext>& out);
 
 // Non-allocating accessors for hot paths that can't tolerate
-// std::vector::reserve under heap fragmentation (BLE QSO_QUEUE read).
+// std::vector::reserve under heap fragmentation.
 int  autoseq_active_count();
 bool autoseq_get_active_context(int idx, QsoContext* out);
 

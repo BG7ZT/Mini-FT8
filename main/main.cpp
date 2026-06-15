@@ -56,6 +56,7 @@ extern "C" {
 #include "esp_sleep.h"
 #include "audio_source.h"
 #include "stream_uac.h"
+#include "dds_q15.h"
 #include "radio_control.h"
 #include "radio_control_backend.h"
 #include "gps.h"
@@ -1939,7 +1940,8 @@ static const char* offset_name(OffsetSrc o) {
 }
 
 static RadioType canonical_radio_type(RadioType r) {
-  if (r == RadioType::KH1_USBC || r == RadioType::KH1_MIC) return r;
+  if (r == RadioType::QDX ||
+      r == RadioType::KH1_USBC || r == RadioType::KH1_MIC) return r;
   return RadioType::QMX;
 }
 
@@ -1965,6 +1967,8 @@ static RadioType radio_type_from_saved_int(int value) {
       return RadioType::KH1_USBC;
     case (int)RadioType::KH1_MIC:
       return RadioType::KH1_MIC;
+    case (int)RadioType::QDX:
+      return RadioType::QDX;
     case (int)RadioType::QMX:
     default:
       return RadioType::QMX;
@@ -1993,6 +1997,9 @@ static RadioType parse_radio_config_value(const char* raw) {
   if (token == "KH1-MIC" || token == "KH1_MIC" || token == "KH1MIC") {
     return RadioType::KH1_MIC;
   }
+  if (token == "QDX") {
+    return RadioType::QDX;
+  }
   return RadioType::QMX;
 }
 
@@ -2002,6 +2009,8 @@ static RadioProfileBinding get_radio_profile_binding(RadioType r) {
       return {AUDIO_SOURCE_USB_UAC_GENERIC, RADIO_CONTROL_KH1_CAT};
     case RadioType::KH1_MIC:
       return {AUDIO_SOURCE_KH1_MIC, RADIO_CONTROL_KH1_CAT};
+    case RadioType::QDX:
+      return {AUDIO_SOURCE_QMX_UAC, RADIO_CONTROL_QDX};
     case RadioType::QMX:
     default:
       return {AUDIO_SOURCE_QMX_UAC, RADIO_CONTROL_QMX};
@@ -2011,6 +2020,7 @@ static RadioProfileBinding get_radio_profile_binding(RadioType r) {
 static const char* radio_name(RadioType r) {
   switch (canonical_radio_type(r)) {
     case RadioType::QMX: return "QMX";
+    case RadioType::QDX: return "QDX";
     case RadioType::KH1_USBC: return "KH1-USBC";
     case RadioType::KH1_MIC: return "KH1-MIC";
     default: break;
@@ -3559,6 +3569,22 @@ static void tx_start(int skip_tones) {
     }
   }
 
+  // QDX uses sample-counted UAC OUT. QMX and KH1 retain their existing
+  // per-symbol CAT paths.
+  if (g_tx_cat_ok && canonical_radio_type(g_radio) == RadioType::QDX) {
+    const int remaining_tones = 79 - g_tx_tone_idx;
+    if (remaining_tones <= 0 ||
+        !uac_tx_begin_cpfsk(static_cast<float>(g_tx_base_hz),
+                            g_tx_tones + g_tx_tone_idx,
+                            static_cast<size_t>(remaining_tones),
+                            6.25f, 7680)) {
+      ESP_LOGW(TAG, "tx_start: QDX UAC OUT start failed");
+      radio_control_end_tx();
+      g_tx_cat_ok = false;
+      return;
+    }
+  }
+
   if (skip_tones > 0) {
     ESP_LOGI("TXTONE", "Skipping first %d tones due to late start", skip_tones);
   }
@@ -4905,6 +4931,10 @@ static void app_task_core0(void* /*param*/) {
   ui_init(radio_type_uses_display_only(g_radio));
   hashtable_init();
 
+  // Q15 NCO LUT for UAC OUT FT8 audio synthesis. One-time table fill,
+  // ~514 B in BSS. Must run before the speaker pump task starts.
+  dds_init();
+
   // Initialize autoseq engine
   autoseq_init();
 
@@ -5761,10 +5791,13 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 } else if (c == '3') {
                   RadioType old_radio = canonical_radio_type(g_radio);
                   audio_source_backend_t old_audio = get_radio_profile_binding(old_radio).audio_backend;
-                    bool was_streaming = audio_source_is_streaming();
-                    switch (canonical_radio_type(g_radio)) {
-                      case RadioType::QMX:
-                        g_radio = RadioType::KH1_USBC;
+                  bool was_streaming = audio_source_is_streaming();
+                  switch (canonical_radio_type(g_radio)) {
+                    case RadioType::QMX:
+                      g_radio = RadioType::QDX;
+                      break;
+                    case RadioType::QDX:
+                      g_radio = RadioType::KH1_USBC;
                       break;
                     case RadioType::KH1_USBC:
                       g_radio = RadioType::KH1_MIC;

@@ -150,10 +150,14 @@ OffsetSrc map_in(CoreOffsetSrc s) {
 }
 
 CoreRadioType map_out(RadioType r) {
-  return (r == RadioType::KH1) ? CoreRadioType::KH1 : CoreRadioType::QMX;
+  if (r == RadioType::KH1_USBC || r == RadioType::KH1_MIC) {
+    return CoreRadioType::KH1;
+  }
+  return (r == RadioType::QDX) ? CoreRadioType::QDX : CoreRadioType::QMX;
 }
 RadioType map_in(CoreRadioType r) {
-  return (r == CoreRadioType::KH1) ? RadioType::KH1 : RadioType::QMX;
+  if (r == CoreRadioType::KH1) return RadioType::KH1;
+  return (r == CoreRadioType::QDX) ? RadioType::QDX : RadioType::QMX;
 }
 
 CoreQsoState map_out(AutoseqState s) {

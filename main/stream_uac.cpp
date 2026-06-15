@@ -1,6 +1,7 @@
 #include "stream_uac.h"
 #include "ft8_audio_pipeline.h"
 #include "resample.h"
+#include "dds_q15.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -79,6 +80,19 @@ static uac_host_device_handle_t s_mic_handle = NULL;
 static cdc_acm_dev_hdl_t s_cdc_handle = NULL;
 static TaskHandle_t s_usb_task_handle = NULL;
 static TaskHandle_t s_uac_task_handle = NULL;
+
+// Speaker (UAC OUT) is captured and fully allocated during enumeration.
+// QDX transmission only resumes or suspends the pre-opened endpoint.
+static uint8_t s_spk_addr = 0;
+static uint8_t s_spk_iface = 0;
+static bool s_spk_known = false;
+static uac_host_device_handle_t s_spk_handle = NULL;
+static TaskHandle_t s_spk_writer_task = NULL;
+static volatile bool s_spk_writer_stop = false;  // permanent shutdown
+static volatile bool s_spk_writer_run = false;   // per-TX gate
+static uint8_t* s_spk_pump_buf = nullptr;
+static uint32_t s_spk_packets_sent = 0;
+static uint32_t s_spk_write_errors = 0;
 static TaskHandle_t s_stream_task_handle = NULL;
 static volatile bool s_stop_requested = false;
 static char s_status_string[64] = "Idle";
@@ -109,6 +123,29 @@ static void stream_uac_task(void* arg);
 static void cdc_close(void);
 static void cdc_try_open(void);
 static void cdc_event_cb(const cdc_acm_host_dev_event_data_t* event, void* user_ctx);
+
+// Speaker constants and event callback forward declaration. The
+// constants are referenced from uac_lib_task's TX_CONNECTED handler
+// (which now pre-opens the speaker on enum) as well as from the
+// pump task itself further down in the file.
+// Speaker ringbuffer must hold one full pump write atomically (push
+// is all-or-none in xRingbuffer). All speaker resources are pre-
+// allocated at TX_CONNECTED enum time (handle, ringbuffer, xfer URBs,
+// pump buffer, writer task) so per-TX is allocation-free.
+//   ringbuffer: 4 KB  (~14 ms of audio at 288 B/ms)
+//   pump:       1.7 KB (6 packets × 288 B) — must fit in ringbuffer
+//   stack:      3 KB  for the writer task
+static const uint32_t SPK_BUFFER_SIZE      = 4000;      // driver ringbuffer
+static const uint32_t SPK_BUFFER_THRESHOLD = 600;       // ~2 ms at 48k/24/stereo
+static const uint32_t SPK_WRITE_TIMEOUT_MS = 200;
+static const uint32_t SPK_PACKET_BYTES     = 288;       // 48 stereo frames × 6 B
+static const uint32_t SPK_PUMP_PACKETS     = 6;         // 6 packets per write = 1728 B
+static const uint32_t SPK_PUMP_BYTES       = SPK_PACKET_BYTES * SPK_PUMP_PACKETS;  // 1728
+static const uint32_t SPK_FRAME_BYTES      = 6;         // L+R, 24-bit each
+static void spk_event_cb(uac_host_device_handle_t dev,
+                         const uac_host_device_event_t event,
+                         void* arg);
+static void spk_writer_task(void* arg);
 static void cdc_new_dev_cb(usb_device_handle_t usb_dev);
 static int uac_read_ft8_samples(void* ctx, float* out, int max_samples);
 static bool uac_should_stop(void* ctx);
@@ -306,6 +343,21 @@ static void usb_lib_task(void* arg) {
     usb_host_config_t host_config = {};
     host_config.skip_phy_setup = false;
     host_config.intr_flags = ESP_INTR_FLAG_LEVEL1;
+
+    // Custom FIFO partitioning enables simultaneous bidirectional ISO
+    // streaming with QDX or QMX hardware. ESP32-S3 has 200 FIFO lines.
+    // Built-in Kconfig biases give either RX 608 / PTX 128
+    // (BIAS_IN, our previous setting) or RX 136 / PTX 600 — neither
+    // covers 24-bit/48k/stereo MPS=300 in both directions at once.
+    //
+    // This split reserves 364 B for RX and 364 B for PTX (91 lines each)
+    // plus 72 B for non-periodic OUT (CDC CAT bulk-OUT). 364 B is enough
+    // for one 300-byte ISO packet plus 64-byte status overhead — i.e.
+    // 1.21x MPS. The host task must drain each packet within the 1 ms
+    // inter-frame window.
+    host_config.fifo_settings_custom.rx_fifo_lines   = 91;   // 364 B
+    host_config.fifo_settings_custom.nptx_fifo_lines = 18;   // 72 B
+    host_config.fifo_settings_custom.ptx_fifo_lines  = 91;   // 364 B
 
     esp_err_t err = usb_host_install(&host_config);
     if (err != ESP_OK) {
@@ -521,7 +573,79 @@ static void uac_lib_task(void* arg) {
                     }
 
                 } else if (evt.driver.event == UAC_HOST_DRIVER_EVENT_TX_CONNECTED) {
-                    ESP_LOGI(TAG, "Speaker connected (ignored)");
+                    s_spk_addr  = evt.driver.addr;
+                    s_spk_iface = evt.driver.iface_num;
+                    s_spk_known = true;
+                    ESP_LOGI(TAG, "Speaker captured: addr=%u iface=%u",
+                             (unsigned)s_spk_addr, (unsigned)s_spk_iface);
+                    // Open and claim the speaker while enumeration-time heap
+                    // is contiguous, then hold it across all TX cycles.
+                    if (!s_spk_handle) {
+                        uac_host_device_config_t cfg = {};
+                        cfg.addr = s_spk_addr;
+                        cfg.iface_num = s_spk_iface;
+                        cfg.buffer_size = SPK_BUFFER_SIZE;
+                        cfg.buffer_threshold = SPK_BUFFER_THRESHOLD;
+                        cfg.callback = spk_event_cb;
+                        cfg.callback_arg = nullptr;
+                        esp_err_t oerr = uac_host_device_open(&cfg, &s_spk_handle);
+                        if (oerr != ESP_OK) {
+                            ESP_LOGE(TAG, "spk pre-open failed at enum: %s",
+                                     esp_err_to_name(oerr));
+                            s_spk_handle = NULL;
+                        } else {
+                            // Claim iface + alloc xfer URBs + EP slot now,
+                            // but pass FLAG_STREAM_SUSPEND_AFTER_START so
+                            // no URBs are queued on the bus yet. The
+                            // 512-byte aligned xfer_desc_list (2x 512B
+                            // for ISOC double-buffering) requires fresh
+                            // heap to satisfy alignment — at TX time the
+                            // largest contiguous block is <2 KB and
+                            // aligned alloc fails. Resume happens at TX
+                            // via uac_host_device_resume (cheap, no
+                            // realloc). Suspend at TX-end stops URB flow
+                            // but keeps everything allocated.
+                            uac_host_stream_config_t scfg = {};
+                            scfg.channels = 2;
+                            scfg.bit_resolution = 24;
+                            scfg.sample_freq = 48000;
+                            scfg.flags = FLAG_STREAM_SUSPEND_AFTER_START;
+                            esp_err_t serr = uac_host_device_start(s_spk_handle, &scfg);
+                            if (serr != ESP_OK) {
+                                ESP_LOGE(TAG, "spk pre-start failed at enum: %s",
+                                         esp_err_to_name(serr));
+                                uac_host_device_close(s_spk_handle);
+                                s_spk_handle = NULL;
+                            } else {
+                                ESP_LOGI(TAG, "Speaker pre-opened+claimed (handle=%p, ringbuf=%u B, suspended)",
+                                         s_spk_handle, (unsigned)SPK_BUFFER_SIZE);
+                                // Allocate the pump buffer + permanent
+                                // writer task NOW too, while heap is
+                                // healthy. Per-TX cost is just flipping
+                                // s_spk_writer_run — no allocs.
+                                if (!s_spk_pump_buf) {
+                                    s_spk_pump_buf = (uint8_t*)heap_caps_malloc(
+                                        SPK_PUMP_BYTES, MALLOC_CAP_DEFAULT);
+                                    if (!s_spk_pump_buf) {
+                                        ESP_LOGE(TAG, "spk pump buf alloc failed at enum");
+                                    }
+                                }
+                                if (s_spk_pump_buf && !s_spk_writer_task) {
+                                    s_spk_writer_stop = false;
+                                    s_spk_writer_run = false;
+                                    BaseType_t ok = xTaskCreatePinnedToCore(
+                                        spk_writer_task, "uac_tx_writer",
+                                        3072, NULL, 5, &s_spk_writer_task, 1);
+                                    if (ok != pdPASS) {
+                                        ESP_LOGE(TAG, "spk writer task create failed at enum");
+                                        s_spk_writer_task = NULL;
+                                    } else {
+                                        ESP_LOGI(TAG, "Speaker writer task ready (idle)");
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -532,6 +656,29 @@ static void uac_lib_task(void* arg) {
         uac_host_device_stop(s_mic_handle);
         uac_host_device_close(s_mic_handle);
         s_mic_handle = NULL;
+    }
+    // Stop the permanent writer task so it exits its loop and frees
+    // its TCB before we tear down the stream / pump buffer.
+    if (s_spk_writer_task) {
+        s_spk_writer_run = false;
+        s_spk_writer_stop = true;
+        for (int i = 0; i < 50 && s_spk_writer_task; ++i) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+    if (s_spk_pump_buf) {
+        free(s_spk_pump_buf);
+        s_spk_pump_buf = nullptr;
+    }
+    if (s_spk_handle) {
+        // Speaker was opened + claimed (suspended) at TX_CONNECTED
+        // enum and held for the lifetime of the host driver. Tear it
+        // down here before uac_host_uninstall() to release xfer URBs
+        // and ringbuffer cleanly.
+        uac_host_device_stop(s_spk_handle);
+        uac_host_device_close(s_spk_handle);
+        s_spk_handle = NULL;
+        s_spk_known = false;
     }
 
     ESP_LOGI(TAG, "UAC driver uninstalling");
@@ -739,6 +886,127 @@ void uac_stop(void) {
     ft8_audio_pipeline_clear_latest_waterfall_row();
     snprintf(s_status_string, sizeof(s_status_string), "Idle");
     ESP_LOGI(TAG, "UAC host stopped");
+}
+
+// UAC OUT synthesis for QDX mode.
+
+static void spk_event_cb(uac_host_device_handle_t /*dev*/,
+                         const uac_host_device_event_t event,
+                         void* /*arg*/) {
+    if (event == UAC_HOST_DEVICE_EVENT_TRANSFER_ERROR) {
+        s_spk_write_errors++;
+        ESP_LOGW(TAG, "spk transfer error");
+    }
+}
+
+static void spk_writer_task(void* /*arg*/) {
+    // Permanent task, gated per transmission. The DDS owns symbol timing.
+    const uint32_t frames_per_block = SPK_PUMP_BYTES / SPK_FRAME_BYTES;  // 2304
+    while (!s_spk_writer_stop) {
+        if (!s_spk_writer_run) {
+            // Idle between TX cycles. Sleep cheaply.
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        dds_render_24bit_stereo(s_spk_pump_buf, frames_per_block);
+        esp_err_t err = uac_host_device_write(s_spk_handle, s_spk_pump_buf, SPK_PUMP_BYTES,
+                                              pdMS_TO_TICKS(SPK_WRITE_TIMEOUT_MS));
+        if (err == ESP_OK) {
+            s_spk_packets_sent += SPK_PUMP_PACKETS;
+        } else if (err != ESP_ERR_TIMEOUT) {
+            s_spk_write_errors++;
+            if (s_spk_write_errors <= 5) {
+                ESP_LOGW(TAG, "spk write err=%s", esp_err_to_name(err));
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        // Yield so IDLE0 can run (watchdog appeasement).
+        vTaskDelay(1);
+    }
+
+    s_spk_writer_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static bool uac_tx_start_writer(void) {
+    if (s_spk_writer_run) {
+        ESP_LOGW(TAG, "UAC OUT already active");
+        return false;
+    }
+    if (!s_spk_known || !s_spk_handle || !s_spk_writer_task) {
+        ESP_LOGW(TAG, "UAC OUT speaker not ready");
+        return false;
+    }
+
+    s_spk_packets_sent = 0;
+    s_spk_write_errors = 0;
+
+    esp_err_t err = uac_host_device_resume(s_spk_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "UAC OUT resume failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    s_spk_writer_run = true;
+    return true;
+}
+
+bool uac_tx_begin_cpfsk(float base_hz,
+                        const uint8_t* symbols,
+                        size_t symbol_count,
+                        float tone_spacing_hz,
+                        uint32_t samples_per_symbol) {
+    if (!dds_cpfsk_begin(static_cast<double>(base_hz), symbols, symbol_count,
+                         static_cast<double>(tone_spacing_hz),
+                         samples_per_symbol)) {
+        ESP_LOGE(TAG, "Invalid CPFSK schedule count=%u samples/symbol=%u",
+                 (unsigned)symbol_count, (unsigned)samples_per_symbol);
+        return false;
+    }
+
+    if (!uac_tx_start_writer()) {
+        dds_cpfsk_end();
+        return false;
+    }
+
+    ESP_LOGI(TAG,
+             "UAC OUT CPFSK start base=%.2f count=%u spacing=%.4f samples/symbol=%u",
+             (double)base_hz, (unsigned)symbol_count, (double)tone_spacing_hz,
+             (unsigned)samples_per_symbol);
+    return true;
+}
+
+bool uac_tx_begin_tune(float tone_hz) {
+    dds_cpfsk_end();
+    dds_reset_phase();
+    dds_set_freq_hz(static_cast<double>(tone_hz));
+    if (!uac_tx_start_writer()) {
+        dds_set_freq_hz(0.0);
+        return false;
+    }
+
+    ESP_LOGI(TAG, "UAC OUT tune start tone=%.2f", (double)tone_hz);
+    return true;
+}
+
+void uac_tx_end(void) {
+    if (!s_spk_writer_run) {
+        dds_cpfsk_end();
+        dds_set_freq_hz(0.0);
+        return;
+    }
+
+    s_spk_writer_run = false;
+    vTaskDelay(pdMS_TO_TICKS(20));
+    dds_cpfsk_end();
+    dds_set_freq_hz(0.0);
+
+    if (s_spk_handle) {
+        uac_host_device_suspend(s_spk_handle);
+    }
+
+    ESP_LOGI(TAG, "UAC OUT stopped packets=%u errors=%u",
+             (unsigned)s_spk_packets_sent, (unsigned)s_spk_write_errors);
 }
 
 const char* uac_get_status_string(void) {

@@ -29,6 +29,7 @@ enum class RadioType {
     KH1_USBC = 3,
     KH1 = KH1_USBC, // Backward-compatible alias for old KH1 USB-C mode.
     KH1_MIC = 4,
+    QDX = 5,
 };
 
 // One entry in the band list (name + frequency in kHz).

@@ -6,10 +6,12 @@ idf_component_register(
          "gps.cpp"
          "radio_control.cpp"
          "radio_control_qmx.cpp"
+         "radio_control_qdx.cpp"
          "radio_control_kh1_cat.cpp"
          "ft8_audio_pipeline.cpp"
          "stream_uac.cpp"
          "stream_mic.cpp"
+         "dds_q15.cpp"
          "resample.cpp"
     INCLUDE_DIRS "."
     REQUIRES ui M5Unified M5GFX M5Cardputer board_cardputer_adv ft8_lib usb_host_uac usb_host_cdc_acm fatfs sdmmc spiffs efuse

@@ -7,6 +7,7 @@
 #include "freertos/FreeRTOS.h"
 #include "driver/gpio.h"
 #include "driver/uart.h"
+#include "esp_err.h"
 #include "esp_log.h"
 #include "kh1_tone_map.h"
 
@@ -104,6 +105,17 @@ static esp_err_t kh1_set_fa_if_changed(int freq10, const char* reason, bool* out
     return err;
 }
 
+static esp_err_t kh1_send_fa_forced(int freq10, const char* reason) {
+    char fa[24];
+    snprintf(fa, sizeof(fa), "FA%07d;", freq10);
+    esp_err_t err = kh1_send_cmd(fa, 200);
+    if (err == ESP_OK) {
+        s_current_fa10 = freq10;
+        ESP_LOGI(TAG, "KH1 FA forced %s FA=%07d", reason ? reason : "", freq10);
+    }
+    return err;
+}
+
 static esp_err_t kh1_sync_frequency_mode(int freq_hz) {
     s_rx_freq10 = hz_to_10hz(freq_hz);
 
@@ -152,24 +164,29 @@ static esp_err_t kh1_end_tx(void) {
     esp_err_t err = kh1_send_cmd("HK0;", 200);
     if (err != ESP_OK) return err;
 
-    // Leave FA at the last TX VFO. Fixed offset then avoids relay-triggering
-    // FA commands after the first matching setup.
-    err = kh1_send_cmd("FO99;", 200);
-    if (err == ESP_OK) {
-        s_tx_active = false;
-        ESP_LOGI(TAG, "KH1 TX stop keep FA=%07d", s_current_fa10);
+    s_tx_active = false;
+
+    // RX decode expects KH1 back on the band dial frequency after every TX.
+    err = kh1_send_fa_forced(s_rx_freq10, "tx-rx");
+    esp_err_t fo_err = kh1_send_cmd("FO99;", 200);
+    if (err != ESP_OK) {
+        if (fo_err != ESP_OK) {
+            ESP_LOGW(TAG, "KH1 TX stop restore FA failed and FO99 also failed: FA=%s FO=%s",
+                     esp_err_to_name(err), esp_err_to_name(fo_err));
+        }
+        return err;
     }
-    return err;
+    if (fo_err != ESP_OK) {
+        return fo_err;
+    }
+
+    ESP_LOGI(TAG, "KH1 TX stop restore FA=%07d", s_rx_freq10);
+    return ESP_OK;
 }
 
 static esp_err_t kh1_set_tune(bool enable, int freq_hz, int tone_hz) {
     if (!enable) {
-        esp_err_t err = kh1_send_cmd("HK0;", 200);
-        if (err == ESP_OK) {
-            s_tx_active = false;
-            ESP_LOGI(TAG, "KH1 tune key up");
-        }
-        return err;
+        return kh1_end_tx();
     }
 
     s_rx_freq10 = hz_to_10hz(freq_hz);

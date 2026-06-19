@@ -21,8 +21,8 @@ Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure betw
   - Optional: [https://shop.m5stack.com/products/gps-bds-unit-v1-1-at6668](https://shop.m5stack.com/products/gps-bds-unit-v1-1-at6668) (PORTA GPS for Date/Time/Grid; other UART NMEA GPS modules work too)
   - Optional: M5Stack LoRa-1262 cap GNSS (set `GNSS_LoRa:ON`; only the GNSS is used)
   - Optional: DS3231 RTC module on I2C `G8/G9` (for retained UTC date/time without GPS)
-  - For KH1 TX : https://shop.m5stack.com/products/4pin-buckled-grove-cable, for a custmized serial cable
-  - For KH1 RX: [USB C Microphone Adapter](https://www.amazon.com/dp/B0FWC9ZFC4?ref=ppx_yo2ov_dt_b_fed_asin_title&th=1), Other adapters may also work, but this one is confirmed. (V2.0.2 Supports Cardputer direct microphone in, so the USB-C adapter becomes **optional, choose KH1-Mic**)
+  - For KH1 TX: https://shop.m5stack.com/products/4pin-buckled-grove-cable, for a custom serial cable
+  - For KH1-USBC RX: [USB-C microphone adapter](https://www.amazon.com/dp/B0FWC9ZFC4?ref=ppx_yo2ov_dt_b_fed_asin_title&th=1). Other adapters may also work, but this one is confirmed. KH1-MIC uses the Cardputer built-in microphone, so the USB-C adapter is optional.
 
 73, Wei AG6AQ
 
@@ -81,7 +81,7 @@ Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure betw
 |  | `6` | Enter Sleep. Shows battery info. |
 | `N` (MENU P2) | `1` | Select offset source: Random / RX / Fixed. Random values are within 500-2500 Hz. |
 |  | `2` | Edit fixed cursor offset (in place). Enter directly or use `▲` `▼` `◀` `▶`. |
-|  | `3` | Select radio (`QMX` / `QDX` / `KH1`). |
+|  | `3` | Select radio (`QMX` / `QDX` / `KH1-USBC` / `KH1-MIC`). |
 |  | `4` | Edit ignore list (Long Edit). Prefixes are separated by spaces; maximum 64 characters. |
 |  | `5` | Edit comment (Long Edit). Used for ADIF logging. Supports `/Radio` and `/Grid` macro expansion. |
 |  | `6` | Select FT8 / FT4 protocol. Reboot to apply the change. |
@@ -124,7 +124,7 @@ Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure betw
 
 Mini-FT8 supports two GPS sources selected from MENU P3 (`O -> 4`):
 
-- `GNSS_LoRa:OFF` uses the PORTA GPS wiring below. Both 9600 and 115200 baud GPS modules are supported and auto-detected. **Make sure the micro swithch is on the left.** Once Mini-FT8 gets its time/grid, the GPS can be removed, this is important for KH1.
+- `GNSS_LoRa:OFF` uses the PORTA GPS wiring below. Both 9600 and 115200 baud GPS modules are supported and auto-detected. **Make sure the micro switch is on the left.** Once Mini-FT8 gets its time/grid, the GPS can be removed, this is important for KH1.
 - `GNSS_LoRa:ON` uses the M5Stack LoRa-1262 cap GNSS on UART2 (`RX=G15`, `TX=G13`) at 115200 baud. The LoRa/SX1262 radio side is not used. This source can keep running while KH1 CAT uses PORTA/UART1.
 
 When `GNSS_LoRa` is `ON`, the physical G4/G5 debug UART path is disabled and the pins are left as floating inputs to avoid conflicts. USB Serial/JTAG host commands still work.
@@ -168,9 +168,10 @@ updates write the DS3231 when it is present; FT8 decode fine corrections do not.
                                      │ SW: NA                     │
                                      └────────────────────────────┘
 ```
-- TX + RX (FT8/FT4 QSO) (V2.0.2 Supports Cardputer direct microphone in, so the **USB-C adapter becomes optional, choose KH1-Mic**)
-  - Use a USB-C audio/mic adapter for RX. Tested adapter: Amazon `B0FWC9ZFC4`. Other adapters may also work, but this one is confirmed.
-  - Supply 5 V to PORTA; otherwise, the USB-C OTG port will not be powered. **Make sure the micro swithch is on the right**
+- TX + RX (FT8/FT4 QSO)
+  - Choose `KH1-USBC` for USB-C audio adapter RX. Tested adapter: Amazon `B0FWC9ZFC4`. Other adapters may also work, but this one is confirmed.
+  - Choose `KH1-MIC` for Cardputer microphone RX. No USB-C audio adapter is needed.
+  - For `KH1-USBC`, supply 5 V to PORTA; otherwise, the USB-C OTG port will not be powered. **Make sure the micro switch is on the right**
 ```text
 ┌──────────────────┐
 │ Power Cable      │

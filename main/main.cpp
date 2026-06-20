@@ -852,7 +852,33 @@ static bool is_daily_qso_txt_file(const char* name) {
   for (int i = 0; i < 8; ++i) {
     if (!std::isdigit(static_cast<unsigned char>(name[i]))) return false;
   }
-  return std::strcmp(name + 8, ".txt") == 0;
+  return name[8] == '.' &&
+         std::tolower(static_cast<unsigned char>(name[9])) == 't' &&
+         std::tolower(static_cast<unsigned char>(name[10])) == 'x' &&
+         std::tolower(static_cast<unsigned char>(name[11])) == 't';
+}
+
+static const char* storage_owner_label(StorageOwner owner) {
+  switch (owner) {
+    case StorageOwner::UNAVAILABLE: return "unavailable";
+    case StorageOwner::FIRMWARE:    return "firmware";
+    case StorageOwner::USB_HOST:    return "usb_host";
+    case StorageOwner::TRANSITION:  return "transition";
+  }
+  return "unknown";
+}
+
+static const char* qso_storage_list_failure_text(StorageOwner owner) {
+  switch (owner) {
+    case StorageOwner::USB_HOST:
+    case StorageOwner::TRANSITION:
+      return "Storage busy";
+    case StorageOwner::UNAVAILABLE:
+      return "Storage unavailable";
+    case StorageOwner::FIRMWARE:
+      return "List failed";
+  }
+  return "List failed";
 }
 
 static void qso_load_file_list() {
@@ -862,7 +888,11 @@ static void qso_load_file_list() {
   g_q_entries_have_next_page = false;
   std::vector<std::string> files;
   if (!storage_file_list(files)) {
-    g_q_lines.push_back("No QSO logs");
+    const StorageOwner owner = storage_service_owner();
+    const char* reason = qso_storage_list_failure_text(owner);
+    ESP_LOGW(TAG, "QSO file list failed: owner=%s reason=%s",
+             storage_owner_label(owner), reason);
+    g_q_lines.push_back(reason);
     return;
   }
   for (const auto& name : files) {
@@ -871,8 +901,13 @@ static void qso_load_file_list() {
     }
   }
   std::sort(g_q_files.begin(), g_q_files.end(), std::greater<std::string>());
+  const StorageOwner owner = storage_service_owner();
+  ESP_LOGI(TAG, "QSO file list: owner=%s files=%u daily=%u",
+           storage_owner_label(owner),
+           static_cast<unsigned>(files.size()),
+           static_cast<unsigned>(g_q_files.size()));
   if (g_q_files.empty()) {
-    g_q_lines.push_back("No QSO logs");
+    g_q_lines.push_back("No YYYYMMDD.txt");
     return;
   }
   for (size_t i = 0; i < g_q_files.size(); ++i) {

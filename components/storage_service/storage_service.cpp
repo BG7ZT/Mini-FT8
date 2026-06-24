@@ -79,6 +79,60 @@ bool firmware_owns_storage_locked() {
     return s_owner == StorageOwner::FIRMWARE && s_msc_storage != nullptr;
 }
 
+bool wl_mount_error_allows_repair(esp_err_t err) {
+    return err != ESP_ERR_NO_MEM && err != ESP_ERR_INVALID_ARG;
+}
+
+esp_err_t mount_wear_levelling_with_repair(const esp_partition_t* partition, bool* repaired) {
+    if (repaired) {
+        *repaired = false;
+    }
+
+    s_wl_handle = WL_INVALID_HANDLE;
+    esp_err_t err = wl_mount(partition, &s_wl_handle);
+    if (err == ESP_OK) {
+        return ESP_OK;
+    }
+
+    s_wl_handle = WL_INVALID_HANDLE;
+    ESP_LOGE(TAG,
+             "wear levelling mount failed for partition '%s' addr=0x%08lx size=0x%08lx: %s",
+             partition->label,
+             static_cast<unsigned long>(partition->address),
+             static_cast<unsigned long>(partition->size),
+             esp_err_to_name(err));
+
+    if (partition->readonly || !wl_mount_error_allows_repair(err)) {
+        ESP_LOGE(TAG, "not erasing internal FATFS partition after wl_mount failure");
+        return err;
+    }
+
+    ESP_LOGW(TAG,
+             "erasing internal FATFS partition '%s' addr=0x%08lx size=0x%08lx after wl_mount failure",
+             partition->label,
+             static_cast<unsigned long>(partition->address),
+             static_cast<unsigned long>(partition->size));
+    esp_err_t erase_err = esp_partition_erase_range(partition, 0, partition->size);
+    ESP_LOGI(TAG, "internal FATFS partition erase result: %s", esp_err_to_name(erase_err));
+    if (erase_err != ESP_OK) {
+        s_wl_handle = WL_INVALID_HANDLE;
+        return erase_err;
+    }
+
+    ESP_LOGI(TAG, "retrying wear levelling mount after internal FATFS erase");
+    err = wl_mount(partition, &s_wl_handle);
+    ESP_LOGI(TAG, "wear levelling retry result: %s", esp_err_to_name(err));
+    if (err != ESP_OK) {
+        s_wl_handle = WL_INVALID_HANDLE;
+        return err;
+    }
+
+    if (repaired) {
+        *repaired = true;
+    }
+    return ESP_OK;
+}
+
 const char* storage_owner_name(StorageOwner owner) {
     switch (owner) {
         case StorageOwner::UNAVAILABLE:
@@ -604,7 +658,8 @@ esp_err_t storage_service_init() {
         return ESP_ERR_NOT_FOUND;
     }
 
-    esp_err_t err = wl_mount(partition, &s_wl_handle);
+    bool repaired_wl_mount = false;
+    esp_err_t err = mount_wear_levelling_with_repair(partition, &repaired_wl_mount);
     if (err != ESP_OK) {
         s_wl_handle = WL_INVALID_HANDLE;
         ESP_LOGE(TAG, "wear levelling mount failed: %s", esp_err_to_name(err));
@@ -642,6 +697,9 @@ esp_err_t storage_service_init() {
     s_owner = StorageOwner::FIRMWARE;
     ESP_LOGI(TAG, "initialized owner: firmware owns %s on partition '%s'",
              kBasePath, kPartitionLabel);
+    if (repaired_wl_mount) {
+        ESP_LOGW(TAG, "internal storage reformatted after wear levelling mount failure");
+    }
     return ESP_OK;
 }
 

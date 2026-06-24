@@ -471,7 +471,7 @@ static std::vector<std::string> g_msc_lines = {
 };
 
 static std::vector<std::string> g_startup_lines = {
-    "** Mini-FT8 V2.1c **",
+    "** Mini-FT8 V2.1d **",
     " S/R/T: Operate",
     " M/N/O: Menu",
     " Q/F/D: File",

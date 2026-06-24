@@ -109,6 +109,12 @@ static std::string storage_basename(const std::string& name_or_path) {
   return name_or_path.substr(slash + 1);
 }
 
+static std::string today_rt_file_name() {
+  char rt_path[64];
+  build_rxtx_log_path(rt_path, sizeof(rt_path));
+  return storage_basename(rt_path);
+}
+
 static bool storage_is_active_log_name(const std::string& name_or_path) {
   const std::string name = storage_basename(name_or_path);
   char rt_path[64];
@@ -118,9 +124,7 @@ static bool storage_is_active_log_name(const std::string& name_or_path) {
          name == "fieldday.txt";
 }
 
-static CopyLogsResult copy_logs_to_sd_overwrite() {
-  return storage_copy_all_to_sd(today_qso_file_name());
-}
+static CopyLogsResult copy_logs_to_sd_overwrite();
 
 // 128 entries × 16 bytes = 2 KB of BSS. 256 was the original size but
 // well over typical working set (FT8 rarely sees >50 unique hashed
@@ -340,6 +344,7 @@ static bool rewrite_dxpedition_for_mycall(const std::string& raw_text,
 }
 
 static const char* TAG = "FT8";
+static const char* STORAGE_COPY_TAG = "STORAGE_COPY";
 enum class UIMode { RX, TX, BAND, MENU, MSC, DEBUG, STATUS, QSO, GPS, PERF };
 enum class RtcTimeSource : uint8_t {
   SAVED = 0,
@@ -466,7 +471,7 @@ static std::vector<std::string> g_msc_lines = {
 };
 
 static std::vector<std::string> g_startup_lines = {
-    "** Mini-FT8 V2.1b **",
+    "** Mini-FT8 V2.1c **",
     " S/R/T: Operate",
     " M/N/O: Menu",
     " Q/F/D: File",
@@ -879,6 +884,58 @@ static const char* qso_storage_list_failure_text(StorageOwner owner) {
       return "List failed";
   }
   return "List failed";
+}
+
+static CopyLogsResult copy_logs_busy_result() {
+  CopyLogsResult result{};
+  result.err = ESP_ERR_INVALID_STATE;
+  result.status = StorageCopyStatus::STORAGE_BUSY;
+  result.missed_count = 1;
+  result.missed_files.push_back("<storage busy>");
+  return result;
+}
+
+static CopyLogsResult copy_logs_to_sd_overwrite() {
+  const std::string qso_name = today_qso_file_name();
+  const std::string rt_name = today_rt_file_name();
+  const StorageOwner owner = storage_service_owner();
+  const size_t open_streams = storage_service_open_stream_count();
+  const bool usb_drive = storage_service_usb_drive_enabled();
+  const bool tx_active = g_tx_active;
+  const bool decode_active = g_decode_in_progress;
+  const bool audio_streaming = audio_source_is_streaming();
+  const bool host_binary_active = host_bin_active;
+  const bool ui_msc = ui_mode == UIMode::MSC;
+
+  ESP_LOGI(STORAGE_COPY_TAG,
+           "request owner=%s open_streams=%u tx=%d decode=%d audio=%d host_bin=%d ui_msc=%d usb_drive=%d qso=%s rt=%s",
+           storage_owner_label(owner),
+           static_cast<unsigned>(open_streams),
+           tx_active,
+           decode_active,
+           audio_streaming,
+           host_binary_active,
+           ui_msc,
+           usb_drive,
+           qso_name.c_str(),
+           rt_name.c_str());
+
+  if (tx_active || decode_active || audio_streaming || host_binary_active ||
+      ui_msc || usb_drive || owner != StorageOwner::FIRMWARE || open_streams != 0) {
+    ESP_LOGW(STORAGE_COPY_TAG,
+             "copy blocked: owner=%s open_streams=%u tx=%d decode=%d audio=%d host_bin=%d ui_msc=%d usb_drive=%d",
+             storage_owner_label(owner),
+             static_cast<unsigned>(open_streams),
+             tx_active,
+             decode_active,
+             audio_streaming,
+             host_binary_active,
+             ui_msc,
+             usb_drive);
+    return copy_logs_busy_result();
+  }
+
+  return storage_copy_all_to_sd(qso_name, rt_name);
 }
 
 static void qso_load_file_list() {
@@ -5492,12 +5549,20 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 CopyLogsResult copy_res = copy_logs_to_sd_overwrite();
                 menu_flash_idx = 16; // abs index of page 2 line 5
                 menu_flash_deadline = rtc_now_ms() + 500;
-                if (copy_res.missed_count <= 0) {
+                if (copy_res.status == StorageCopyStatus::SD_MOUNT_FAILED) {
+                  menu_copy_feedback_text = "SD mount fail";
+                } else if (copy_res.status == StorageCopyStatus::STORAGE_BUSY) {
+                  menu_copy_feedback_text = "Storage busy";
+                } else if (copy_res.status == StorageCopyStatus::LIST_FAILED) {
+                  menu_copy_feedback_text = "List failed";
+                } else if (copy_res.missed_count <= 0) {
                   menu_copy_feedback_text = "Copied OK";
+                } else if (copy_res.missed_count == 1 && !copy_res.missed_files.empty()) {
+                  menu_copy_feedback_text =
+                      std::string("Fail ") + head_trim(storage_basename(copy_res.missed_files.front()), 14);
                 } else {
-                  char fb[20];
-                  snprintf(fb, sizeof(fb), "Missed %d", copy_res.missed_count);
-                  menu_copy_feedback_text = fb;
+                  menu_copy_feedback_text =
+                      std::string("Missed ") + std::to_string(copy_res.missed_count) + ", see log";
                 }
                 if (menu_copy_feedback_text.size() > 19) {
                   menu_copy_feedback_text.resize(19);
@@ -5510,6 +5575,9 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 debug_log_line(log_msg);
                 if (copy_res.err == ESP_OK) {
                   debug_log_line("Copied storage files to SD");
+                } else if (!copy_res.missed_files.empty()) {
+                  debug_log_line(std::string("Copy fail: ") +
+                                 head_trim(storage_basename(copy_res.missed_files.front()), 16));
                 }
 
                 draw_menu_view();

@@ -37,6 +37,7 @@ constexpr gpio_num_t kSdClock = GPIO_NUM_40;
 constexpr gpio_num_t kSdChipSelect = GPIO_NUM_12;
 
 const char* TAG = "storage_service";
+const char* COPY_TAG = "STORAGE_COPY";
 
 StaticSemaphore_t s_mutex_buffer;
 SemaphoreHandle_t s_mutex;
@@ -78,6 +79,20 @@ bool firmware_owns_storage_locked() {
     return s_owner == StorageOwner::FIRMWARE && s_msc_storage != nullptr;
 }
 
+const char* storage_owner_name(StorageOwner owner) {
+    switch (owner) {
+        case StorageOwner::UNAVAILABLE:
+            return "unavailable";
+        case StorageOwner::FIRMWARE:
+            return "firmware";
+        case StorageOwner::USB_HOST:
+            return "usb_host";
+        case StorageOwner::TRANSITION:
+            return "transition";
+    }
+    return "unknown";
+}
+
 bool normalize_name(const std::string& input, std::string& name) {
     name = input;
     const std::string prefix = std::string(kBasePath) + "/";
@@ -102,6 +117,15 @@ bool build_path(const std::string& input, std::string& path) {
 
 bool sync_file(FILE* file) {
     return file && fflush(file) == 0 && fsync(fileno(file)) == 0;
+}
+
+bool flush_all_locked() {
+    errno = 0;
+    const int rc = fflush(nullptr);
+    const int err_no = errno;
+    ESP_LOGI(COPY_TAG, "pre-copy flush: rc=%d errno=%d (%s)",
+             rc, err_no, strerror(err_no));
+    return rc == 0;
 }
 
 bool write_atomic_locked(const std::string& input, const std::string& content) {
@@ -226,54 +250,219 @@ void unmount_sd_locked() {
     spi_bus_free(SPI2_HOST);
 }
 
-esp_err_t copy_file_locked(const std::string& source, const std::string& destination) {
+struct CopyFileStatus {
+    esp_err_t err = ESP_OK;
+    int err_no = 0;
+    const char* stage = "ok";
+};
+
+CopyFileStatus copy_error(esp_err_t err, int err_no, const char* stage) {
+    CopyFileStatus status;
+    status.err = err;
+    status.err_no = err_no;
+    status.stage = stage;
+    return status;
+}
+
+CopyFileStatus copy_file_locked(const std::string& source, const std::string& destination) {
     FILE* input = fopen(source.c_str(), "rb");
     if (!input) {
-        return ESP_FAIL;
+        return copy_error(ESP_FAIL, errno, "open-src");
     }
     FILE* output = fopen(destination.c_str(), "wb");
     if (!output) {
+        const int err_no = errno;
         fclose(input);
-        return ESP_FAIL;
+        return copy_error(ESP_FAIL, err_no, "open-dst");
     }
 
     uint8_t buffer[4096];
-    bool ok = true;
+    CopyFileStatus status;
     while (true) {
         const size_t count = fread(buffer, 1, sizeof(buffer), input);
         if (count > 0 && fwrite(buffer, 1, count, output) != count) {
-            ok = false;
+            status = copy_error(ESP_FAIL, errno, "write");
             break;
         }
         if (count < sizeof(buffer)) {
             if (ferror(input)) {
-                ok = false;
+                status = copy_error(ESP_FAIL, errno, "read");
             }
             break;
         }
     }
-    ok = ok && sync_file(output);
-    if (fclose(output) != 0) {
-        ok = false;
+    if (status.err == ESP_OK) {
+        if (fflush(output) != 0) {
+            status = copy_error(ESP_FAIL, errno, "flush-dst");
+        } else if (fsync(fileno(output)) != 0) {
+            status = copy_error(ESP_FAIL, errno, "fsync-dst");
+        }
+    }
+    if (fclose(output) != 0 && status.err == ESP_OK) {
+        status = copy_error(ESP_FAIL, errno, "close-dst");
     }
     fclose(input);
-    return ok ? ESP_OK : ESP_FAIL;
+    return status;
 }
 
-esp_err_t copy_file_retry_locked(const std::string& source,
-                                 const std::string& destination,
-                                 int attempts = 5) {
-    esp_err_t result = ESP_FAIL;
+CopyFileStatus copy_file_retry_locked(const std::string& name,
+                                      const std::string& source,
+                                      const std::string& destination,
+                                      const char* pass_name,
+                                      int attempts = 5) {
+    CopyFileStatus result = copy_error(ESP_FAIL, 0, "not-run");
     for (int attempt = 0; attempt < attempts; ++attempt) {
         result = copy_file_locked(source, destination);
-        if (result == ESP_OK) {
+        if (result.err == ESP_OK) {
             break;
         }
+        ESP_LOGW(COPY_TAG,
+                 "copy attempt failed pass=%s file=%s attempt=%d/%d err=%s errno=%d (%s) stage=%s",
+                 pass_name, name.c_str(), attempt + 1, attempts,
+                 esp_err_to_name(result.err), result.err_no, strerror(result.err_no),
+                 result.stage);
         if (attempt + 1 < attempts) {
             vTaskDelay(pdMS_TO_TICKS(80));
         }
     }
     return result;
+}
+
+struct CopyFileRecord {
+    std::string name;
+    bool copied = false;
+    CopyFileStatus last_status = copy_error(ESP_FAIL, 0, "not-run");
+};
+
+CopyFileRecord& copy_record_for(std::vector<CopyFileRecord>& records,
+                                const std::string& name) {
+    for (CopyFileRecord& record : records) {
+        if (record.name == name) {
+            return record;
+        }
+    }
+    records.push_back(CopyFileRecord {});
+    records.back().name = name;
+    return records.back();
+}
+
+bool source_file_size_locked(const std::string& source, long long& size) {
+    struct stat info {};
+    if (stat(source.c_str(), &info) != 0 || !S_ISREG(info.st_mode)) {
+        size = -1;
+        return false;
+    }
+    size = static_cast<long long>(info.st_size);
+    return true;
+}
+
+CopyFileStatus copy_named_file_locked(const std::string& name,
+                                      const char* pass_name,
+                                      int attempts) {
+    std::string source;
+    if (!build_path(name, source)) {
+        ESP_LOGW(COPY_TAG, "copy skipped pass=%s file=%s invalid source name",
+                 pass_name, name.c_str());
+        return copy_error(ESP_ERR_INVALID_ARG, EINVAL, "build-src");
+    }
+
+    long long source_size = -1;
+    if (!source_file_size_locked(source, source_size)) {
+        const int err_no = errno;
+        ESP_LOGW(COPY_TAG,
+                 "copy skipped pass=%s file=%s source=%s stat failed errno=%d (%s)",
+                 pass_name, name.c_str(), source.c_str(), err_no, strerror(err_no));
+        return copy_error(ESP_FAIL, err_no, "stat-src");
+    }
+
+    const std::string destination = std::string(kSdBasePath) + "/" + name;
+    ESP_LOGI(COPY_TAG,
+             "copy start pass=%s file=%s size=%lld source=%s destination=%s attempts=%d",
+             pass_name, name.c_str(), source_size, source.c_str(), destination.c_str(),
+             attempts);
+    CopyFileStatus status =
+        copy_file_retry_locked(name, source, destination, pass_name, attempts);
+    if (status.err == ESP_OK) {
+        ESP_LOGI(COPY_TAG, "copy ok pass=%s file=%s size=%lld destination=%s",
+                 pass_name, name.c_str(), source_size, destination.c_str());
+    } else {
+        ESP_LOGE(COPY_TAG,
+                 "copy failed pass=%s file=%s size=%lld destination=%s err=%s errno=%d (%s) stage=%s",
+                 pass_name, name.c_str(), source_size, destination.c_str(),
+                 esp_err_to_name(status.err), status.err_no, strerror(status.err_no),
+                 status.stage);
+    }
+    return status;
+}
+
+void set_copy_status(std::vector<CopyFileRecord>& records,
+                     const std::string& name,
+                     const CopyFileStatus& status) {
+    CopyFileRecord& record = copy_record_for(records, name);
+    record.last_status = status;
+    if (status.err == ESP_OK) {
+        record.copied = true;
+    }
+}
+
+void copy_file_record_locked(std::vector<CopyFileRecord>& records,
+                             const std::string& name,
+                             const char* pass_name,
+                             int attempts) {
+    const CopyFileStatus status = copy_named_file_locked(name, pass_name, attempts);
+    set_copy_status(records, name, status);
+}
+
+void copy_missing_pass_locked(std::vector<CopyFileRecord>& records,
+                              const char* pass_name,
+                              int attempts) {
+    const size_t record_count = records.size();
+    for (size_t i = 0; i < record_count; ++i) {
+        if (!records[i].copied) {
+            copy_file_record_locked(records, records[i].name, pass_name, attempts);
+        }
+    }
+}
+
+void copy_active_file_if_present_locked(std::vector<CopyFileRecord>& records,
+                                        const std::string& name,
+                                        const char* pass_name,
+                                        int attempts) {
+    if (name.empty()) {
+        return;
+    }
+
+    std::string source;
+    long long source_size = -1;
+    if (!build_path(name, source) || !source_file_size_locked(source, source_size)) {
+        ESP_LOGI(COPY_TAG, "active retry skipped pass=%s file=%s exists=0",
+                 pass_name, name.c_str());
+        return;
+    }
+
+    copy_file_record_locked(records, name, pass_name, attempts);
+}
+
+void log_missed_files(const std::vector<std::string>& missed_files) {
+    if (missed_files.empty()) {
+        ESP_LOGI(COPY_TAG, "missed files: <none>");
+        return;
+    }
+
+    std::string missed;
+    for (const std::string& name : missed_files) {
+        if (!missed.empty()) {
+            missed += ",";
+        }
+        missed += name;
+    }
+    ESP_LOGW(COPY_TAG, "missed files: %s", missed.c_str());
+}
+
+void log_copy_summary(const StorageCopyResult& result) {
+    log_missed_files(result.missed_files);
+    ESP_LOGI(COPY_TAG, "end copied=%d missed=%d err=%s",
+             result.copied_count, result.missed_count, esp_err_to_name(result.err));
 }
 
 bool cabrillo_ensure_header_locked(const std::string& path,
@@ -814,44 +1003,109 @@ bool storage_sync_station_from_sd() {
     return write_ok;
 }
 
-StorageCopyResult storage_copy_all_to_sd(const std::string& priority_file) {
-    StorageCopyResult result {};
+bool storage_service_flush_all() {
     StorageGuard guard;
     if (!guard.held() || !firmware_owns_storage_locked()) {
+        return false;
+    }
+    return flush_all_locked();
+}
+
+StorageCopyResult storage_copy_all_to_sd(const std::string& priority_file,
+                                         const std::string& priority_file2) {
+    StorageCopyResult result {};
+    StorageGuard guard;
+    ESP_LOGI(COPY_TAG,
+             "begin owner=%s open_streams=%u tinyusb=%d sd_mounted=%d source_base=%s sd_base=%s",
+             storage_owner_name(s_owner), static_cast<unsigned>(s_open_streams),
+             s_tinyusb_installed, s_sd_mounted, kBasePath, kSdBasePath);
+
+    if (!guard.held()) {
         result.err = ESP_ERR_INVALID_STATE;
+        result.status = StorageCopyStatus::STORAGE_BUSY;
         result.missed_count = 1;
+        result.missed_files.push_back("<storage lock>");
+        ESP_LOGE(COPY_TAG, "storage lock unavailable");
+        log_copy_summary(result);
         return result;
     }
+
+    if (!firmware_owns_storage_locked() || s_open_streams != 0) {
+        result.err = ESP_ERR_INVALID_STATE;
+        result.status = StorageCopyStatus::STORAGE_BUSY;
+        result.missed_count = 1;
+        result.missed_files.push_back("<storage busy>");
+        ESP_LOGW(COPY_TAG, "copy blocked owner=%s open_streams=%u",
+                 storage_owner_name(s_owner), static_cast<unsigned>(s_open_streams));
+        log_copy_summary(result);
+        return result;
+    }
+
+    const bool flush_ok = flush_all_locked();
+    ESP_LOGI(COPY_TAG, "active log flush result=%d", flush_ok);
 
     std::vector<std::string> files;
     if (!list_files_locked(files)) {
         result.err = ESP_FAIL;
+        result.status = StorageCopyStatus::LIST_FAILED;
         result.missed_count = 1;
+        result.missed_files.push_back("<list failed>");
+        ESP_LOGE(COPY_TAG, "source file list failed base=%s", kBasePath);
+        log_copy_summary(result);
         return result;
     }
-    if (mount_sd_locked() != ESP_OK) {
-        result.err = ESP_FAIL;
+    std::sort(files.begin(), files.end());
+    ESP_LOGI(COPY_TAG, "source file discovery count=%u",
+             static_cast<unsigned>(files.size()));
+
+    const esp_err_t mount_err = mount_sd_locked();
+    ESP_LOGI(COPY_TAG, "SD mount result=%s", esp_err_to_name(mount_err));
+    if (mount_err != ESP_OK) {
+        result.err = mount_err;
+        result.status = StorageCopyStatus::SD_MOUNT_FAILED;
         result.missed_count = std::max(1, static_cast<int>(files.size()));
+        result.missed_files = files;
+        if (result.missed_files.empty()) {
+            result.missed_files.push_back("<sd mount>");
+        }
+        ESP_LOGE(COPY_TAG, "SD mount failed err=%s missed_count=%d",
+                 esp_err_to_name(mount_err), result.missed_count);
+        log_copy_summary(result);
         return result;
     }
 
-    std::sort(files.begin(), files.end());
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    std::vector<CopyFileRecord> records;
+    records.reserve(files.size() + 2);
     for (const std::string& name : files) {
-        std::string source;
-        if (!build_path(name, source)) {
-            ++result.missed_count;
-            continue;
-        }
-        const std::string destination = std::string(kSdBasePath) + "/" + name;
-        const int attempts = name == priority_file ? 6 : 5;
-        if (copy_file_retry_locked(source, destination, attempts) == ESP_OK) {
+        copy_file_record_locked(records, name, "first", name == priority_file ? 6 : 5);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(120));
+    copy_missing_pass_locked(records, "retry-missed", 5);
+
+    copy_active_file_if_present_locked(records, priority_file, "final-qso", 6);
+    copy_active_file_if_present_locked(records, priority_file2, "final-rt", 6);
+
+    for (const CopyFileRecord& record : records) {
+        if (record.copied) {
             ++result.copied_count;
         } else {
             ++result.missed_count;
+            result.missed_files.push_back(record.name);
+            ESP_LOGE(COPY_TAG,
+                     "missed file=%s err=%s errno=%d (%s) stage=%s",
+                     record.name.c_str(), esp_err_to_name(record.last_status.err),
+                     record.last_status.err_no, strerror(record.last_status.err_no),
+                     record.last_status.stage);
         }
     }
 
     unmount_sd_locked();
     result.err = result.missed_count == 0 ? ESP_OK : ESP_FAIL;
+    result.status = result.missed_count == 0 ? StorageCopyStatus::OK
+                                             : StorageCopyStatus::COPY_FAILED;
+    log_copy_summary(result);
     return result;
 }

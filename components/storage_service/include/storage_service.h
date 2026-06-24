@@ -20,12 +20,22 @@ enum class StorageOpenMode : uint8_t {
     APPEND,
 };
 
+enum class StorageCopyStatus : uint8_t {
+    OK,
+    STORAGE_BUSY,
+    SD_MOUNT_FAILED,
+    LIST_FAILED,
+    COPY_FAILED,
+};
+
 struct StorageStream;
 
 struct StorageCopyResult {
     esp_err_t err = ESP_OK;
+    StorageCopyStatus status = StorageCopyStatus::OK;
     int copied_count = 0;
     int missed_count = 0;
+    std::vector<std::string> missed_files;
 };
 
 esp_err_t storage_service_init();
@@ -59,4 +69,6 @@ bool storage_stream_sync(StorageStream* stream);
 void storage_stream_close(StorageStream* stream);
 
 bool storage_sync_station_from_sd();
-StorageCopyResult storage_copy_all_to_sd(const std::string& priority_file);
+bool storage_service_flush_all();
+StorageCopyResult storage_copy_all_to_sd(const std::string& priority_file,
+                                         const std::string& priority_file2 = "");

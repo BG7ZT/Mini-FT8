@@ -2005,6 +2005,27 @@ void rebuild_ignore_prefixes() {
   }
 }
 
+void sync_ignore_prefix_text_from_list() {
+  std::vector<std::string> normalized;
+  for (const auto& prefix : g_ignore_prefixes) {
+    std::string norm = normalize_call_token(prefix);
+    if (norm.empty()) continue;
+    if (std::find(normalized.begin(), normalized.end(), norm) == normalized.end()) {
+      normalized.push_back(norm);
+    }
+  }
+
+  std::string text;
+  for (const auto& prefix : normalized) {
+    const size_t needed = text.size() + (text.empty() ? 0 : 1) + prefix.size();
+    if (needed > kIgnorePrefixTextMaxLen) break;
+    if (!text.empty()) text.push_back(' ');
+    text += prefix;
+  }
+  g_ignore_prefix_text = text;
+  rebuild_ignore_prefixes();
+}
+
 static bool ignorelist_matches_normalized_dxcall(const std::string& dxcall_norm) {
   if (dxcall_norm.empty()) return false;
   for (const auto& prefix : g_ignore_prefixes) {
@@ -2144,6 +2165,16 @@ std::string grid_ft8_4(const std::string& grid) {
   const std::string norm = normalize_grid_maidenhead(grid);
   if (norm.size() >= 4) return norm.substr(0, 4);
   return "CM97";
+}
+
+bool set_manual_grid_config(const std::string& grid) {
+  const std::string norm_grid = normalize_grid_maidenhead(grid);
+  if (norm_grid.empty()) return false;
+  g_grid = norm_grid;
+  g_grid_saved_manual = g_grid;
+  g_grid_from_gps = false;
+  g_grid_gps_display8.clear();
+  return true;
 }
 
 static std::string menu_sleep_batt_line() {
